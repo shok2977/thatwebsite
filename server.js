@@ -1,6 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const compression = require("compression");
+const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
 const { Readable } = require("stream");
@@ -112,12 +113,63 @@ const searchCache = {};
 
 const CACHE_MS = Number(process.env.CACHE_TTL_MS) || 10 * 60 * 1000;
 const STREAM_CACHE_MS = Number(process.env.STREAM_CACHE_TTL_MS) || 30 * 60 * 1000;
-const STREAM_CACHE_MAX = Number(process.env.STREAM_CACHE_MAX) || 200;
+const STREAM_CACHE_MAX = Number(process.env.STREAM_CACHE_MAX) || 500;
 const SEARCH_CACHE_MS = Number(process.env.SEARCH_CACHE_TTL_MS) || 5 * 60 * 1000;
 const SEARCH_CACHE_MAX = Number(process.env.SEARCH_CACHE_MAX) || 50;
+const STREAM_EXPIRY_MARGIN_MS = 5 * 60 * 1000; // stop serving 5min before token death
 
 // Track which categories are currently being fetched in background
 const backgroundFetches = new Set();
+
+/* ---------- Always-fresh stream URLs ---------- */
+// xHamster m3u8 tokens embed an expiry epoch: "...,1787954400/..." or "end=1787954400"
+function parseStreamExpiry(url) {
+  if (typeof url !== "string") return 0;
+  let m = /[,&]end=(\d{10,13})/.exec(url) || /[=,](\d{13})\/|[,=](\d{10})\//.exec(url);
+  if (m) {
+    const raw = m[1] || m[2] || m[3];
+    if (raw) return Number(raw) < 1e12 ? Number(raw) * 1000 : Number(raw);
+  }
+  const comma = /,(\d{10,13})\//.exec(url);
+  if (comma) {
+    const raw = comma[1];
+    return Number(raw) < 1e12 ? Number(raw) * 1000 : Number(raw);
+  }
+  return 0;
+}
+
+function isStreamFresh(entry, now) {
+  if (!entry || !entry.m3u8Url) return false;
+  now = now || Date.now();
+  if (now - (entry.ts || 0) >= STREAM_CACHE_MS) return false;
+  if (entry.exp && now > entry.exp - STREAM_EXPIRY_MARGIN_MS) return false;
+  // No stored exp — parse from URL as a safety net
+  const exp = entry.exp || parseStreamExpiry(entry.m3u8Url);
+  if (exp && now > exp - STREAM_EXPIRY_MARGIN_MS) return false;
+  return true;
+}
+
+function purgeExpiredStreams() {
+  const now = Date.now();
+  let purged = 0;
+  for (const key of Object.keys(streamCache)) {
+    if (!isStreamFresh(streamCache[key], now)) { delete streamCache[key]; purged++; }
+  }
+  // Hard cap: drop oldest entries if still over limit
+  const keys = Object.keys(streamCache);
+  if (keys.length > STREAM_CACHE_MAX) {
+    keys.sort((a, b) => (streamCache[a].ts || 0) - (streamCache[b].ts || 0));
+    for (let i = 0; i < keys.length - STREAM_CACHE_MAX; i++) delete streamCache[keys[i]];
+  }
+  if (purged > 0) { console.log("[StreamCache] Purged", purged, "expired entries"); saveStreamCache(); }
+  return purged;
+}
+setInterval(purgeExpiredStreams, 5 * 60 * 1000).unref();
+
+function cacheStream(videoUrl, m3u8Url) {
+  // Latest URL always wins — replace any older entry
+  streamCache[videoUrl] = { ts: Date.now(), m3u8Url, exp: parseStreamExpiry(m3u8Url) || 0 };
+}
 
 /* ---------- Cache persistence ---------- */
 function loadCachesFromDisk() {
@@ -138,14 +190,48 @@ function loadCachesFromDisk() {
   } catch (e) { /* ignore */ }
   try {
     if (fs.existsSync(STREAM_CACHE_FILE)) {
-      streamCache = JSON.parse(fs.readFileSync(STREAM_CACHE_FILE, "utf8"));
+      const loaded = JSON.parse(fs.readFileSync(STREAM_CACHE_FILE, "utf8"));
+      const now = Date.now();
+      let kept = 0;
+      for (const [k, v] of Object.entries(loaded)) {
+        // Keep only entries that are still fresh — drops expired-token URLs from disk
+        if (v && v.m3u8Url && now - (v.ts || 0) < STREAM_CACHE_MS) { streamCache[k] = v; kept++; }
+      }
+      console.log("[StreamCache] Loaded", kept, "fresh of", Object.keys(loaded).length, "on disk");
     }
   } catch (e) { /* ignore */ }
 }
 loadCachesFromDisk();
 
-function saveFeedCache() { try { fs.writeFileSync(CACHE_FILE, JSON.stringify(feedCache)); } catch (e) {} }
-function saveStreamCache() { try { fs.writeFileSync(STREAM_CACHE_FILE, JSON.stringify(streamCache)); } catch (e) {} }
+function atomicWrite(file, data) {
+  const tmp = file + ".tmp";
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
+
+let feedSaveTimer = null;
+let streamSaveTimer = null;
+// Debounced + atomic saves — a 10MB sync write on every fetch was blocking the event loop
+function saveFeedCache() {
+  if (feedSaveTimer) return;
+  feedSaveTimer = setTimeout(() => {
+    feedSaveTimer = null;
+    try { atomicWrite(CACHE_FILE, JSON.stringify(feedCache)); } catch (e) {}
+  }, 5000);
+}
+function saveStreamCache() {
+  if (streamSaveTimer) return;
+  streamSaveTimer = setTimeout(() => {
+    streamSaveTimer = null;
+    try { atomicWrite(STREAM_CACHE_FILE, JSON.stringify(streamCache)); } catch (e) {}
+  }, 2000);
+}
+function flushCaches() {
+  if (feedSaveTimer) { clearTimeout(feedSaveTimer); feedSaveTimer = null; }
+  if (streamSaveTimer) { clearTimeout(streamSaveTimer); streamSaveTimer = null; }
+  try { atomicWrite(CACHE_FILE, JSON.stringify(feedCache)); } catch (e) {}
+  try { atomicWrite(STREAM_CACHE_FILE, JSON.stringify(streamCache)); } catch (e) {}
+}
 
 /* ---------- Jina relay fetch ---------- */
 const RELAY_TIMEOUT_MS = 8000;
@@ -221,6 +307,27 @@ function fetchViaRelayCurl(url, timeoutSec) {
   });
 }
 
+/* ---------- Direct fetch (fastest path, no relay round-trip) ---------- */
+function shellEscapeSingleQuoted(s) {
+  return String(s).replace(/'/g, `'\\''`);
+}
+
+function fetchDirectCurl(url, timeoutSec) {
+  const timeout = timeoutSec || 7;
+  const safeUrl = shellEscapeSingleQuoted(url);
+  const cmd = `curl -s -L --compressed --max-time ${timeout} -H 'User-Agent: ${shellEscapeSingleQuoted(UA)}' -H 'Accept: text/html,application/xhtml+xml' -H 'Accept-Language: en-US,en;q=0.9' -H 'Referer: https://xhamster.com/' '${safeUrl}'`;
+  return new Promise((resolve, reject) => {
+    exec(cmd, { timeout: timeout * 1000 + 2000, maxBuffer: 50 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
+      if (err) return reject(new Error("direct curl failed: " + (err.message || String(err))));
+      resolve(stdout);
+    });
+  });
+}
+
+function isValidPageHtml(html) {
+  return typeof html === "string" && html.length > 5000 && html.includes("window.initials");
+}
+
 async function fetchViaRelayUrl(fullUrl) {
   const relayUrl = RELAY_BASE + fullUrl;
   let lastErr;
@@ -228,7 +335,7 @@ async function fetchViaRelayUrl(fullUrl) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const html = await fetchViaRelayCurl(relayUrl, 8);
-      if (html && html.length > 5000 && html.includes("window.initials")) return html;
+      if (isValidPageHtml(html)) return html;
       lastErr = new Error("relay returned no valid content (" + (html ? html.length : 0) + " bytes)");
     } catch (e) { lastErr = e; }
     if (attempt < 1) await new Promise((r) => setTimeout(r, 1500));
@@ -247,6 +354,30 @@ async function fetchViaRelayUrl(fullUrl) {
     }
   }
   throw lastErr || new Error("relay fetch failed");
+}
+
+/* ---------- Race fetch: direct-first + relay in parallel, first valid wins ---------- */
+async function fetchPageHtml(url) {
+  // Promise.race where only VALID html resolves; first valid wins, loser ignored
+  const tryDirect = (async () => {
+    const html = await fetchDirectCurl(url, 7);
+    if (!isValidPageHtml(html)) throw new Error("direct: no initials");
+    return html;
+  })();
+  const tryRelay = (async () => {
+    // small head start for direct (usually much faster); relay starts right after
+    const html = await fetchViaRelayUrl(url);
+    if (!isValidPageHtml(html)) throw new Error("relay: no initials");
+    return html;
+  })();
+  try {
+    return await Promise.race([tryDirect, tryRelay]);
+  } catch (e) {
+    // Both rejected — see if the other one eventually made it
+    const results = await Promise.allSettled([tryDirect, tryRelay]);
+    for (const r of results) if (r.status === "fulfilled") return r.value;
+    throw new Error("all fetch strategies failed: " + (e.message || e));
+  }
 }
 
 /* ---------- JSON parser ---------- */
@@ -392,9 +523,10 @@ function parseCards(html) {
 }
 
 async function fetchVideoPageForStream(pageUrl) {
-  const fullUrl = /^https?:\/\//.test(pageUrl) ? pageUrl : "https://xhamster.com" + pageUrl;
+  const full = /^https?:\/\//.test(pageUrl) ? pageUrl : "https://xhamster.com" + pageUrl;
   try {
-    const html = await fetchViaRelayUrl(fullUrl);
+    // Direct-first race — usually resolves in well under 2s
+    const html = await fetchPageHtml(full);
     return extractM3u8FromHtml(html);
   } catch (e) {
     throw new Error("Could not fetch video page: " + e.message);
@@ -415,52 +547,16 @@ function evictSearchCache() {
 /* ============================================================ */
 /*                ENRICH CARDS WITH STREAM URLs                  */
 /* ============================================================ */
+// ONLY fresh streams are attached — an expired-token URL must never reach the player
 function enrichCardsWithStreams(cards) {
   return cards.map(card => {
     const videoUrl = card.pageUrl ? (fullUrl(card.pageUrl) || card.pageUrl) : null;
-    if (videoUrl && streamCache[videoUrl] && streamCache[videoUrl].m3u8Url) {
-      return { ...card, stream: streamCache[videoUrl].m3u8Url };
+    const entry = videoUrl ? streamCache[videoUrl] : null;
+    if (isStreamFresh(entry)) {
+      return { ...card, stream: entry.m3u8Url };
     }
-    return card;
+    return { ...card, stream: "" };
   });
-}
-
-/* ============================================================ */
-/*             AUTO-FETCH STREAMS FOR CARDS                     */
-/* ============================================================ */
-const autoStreamFetching = new Set();
-async function autoFetchStreamsForCards(cards) {
-  const urls = cards
-    .map(c => c.pageUrl ? (fullUrl(c.pageUrl) || c.pageUrl) : null)
-    .filter(u => u && !streamCache[u] && !autoStreamFetching.has(u));
-  if (urls.length === 0) return;
-  if (autoStreamFetching.size > 3) return; // limit concurrent batches
-  urls.forEach(u => autoStreamFetching.add(u));
-  console.log("[AutoStream] Fetching streams for", urls.length, "videos...");
-  const CONCURRENCY = 5; // low concurrency to avoid blocking event loop
-  let done = 0;
-  const allBatches = [];
-  for (let i = 0; i < urls.length; i += CONCURRENCY) {
-    allBatches.push(urls.slice(i, i + CONCURRENCY));
-  }
-  for (const batch of allBatches) {
-    await Promise.allSettled(batch.map(async (url) => {
-      try {
-        const html = await fetchViaRelayUrl(url);
-        const m3u8 = extractM3u8FromHtml(html);
-        if (m3u8) {
-          streamCache[url] = { ts: Date.now(), m3u8Url: m3u8 };
-          done++;
-        }
-      } catch (e) { /* skip */ }
-    }));
-    saveStreamCache();
-    // Small delay between batches to keep event loop responsive
-    await new Promise(r => setTimeout(r, 200));
-  }
-  urls.forEach(u => autoStreamFetching.delete(u));
-  saveStreamCache();
-  console.log("[AutoStream] Done:", done + "/" + urls.length, "streams cached");
 }
 
 /* ============================================================ */
@@ -471,17 +567,55 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
   backgroundFetches.add(cacheKey);
   try {
     console.log("[Background] Fetching", cacheKey, "...");
-    const html = await fetchViaRelayUrl(catUrl);
+    const html = await fetchPageHtml(catUrl);
     const cards = parseCards(html);
-    feedCache.pages[cacheKey] = { ts: Date.now(), cards };
-    saveFeedCache();
+    if (cards.length > 0) {
+      feedCache.pages[cacheKey] = { ts: Date.now(), cards };
+      saveFeedCache();
+    }
     console.log("[Background]", cacheKey + ":", cards.length, "videos loaded");
-    // AUTO-FETCH streams for all newly loaded cards (fire-and-forget)
-    autoFetchStreamsForCards(cards).catch(() => {});
   } catch (e) {
     console.warn("[Background] Failed:", cacheKey, e.message);
   } finally {
     backgroundFetches.delete(cacheKey);
+  }
+}
+
+/* ---------- Paced refresh queue (keeps relay load gentle) ---------- */
+const refreshQueue = [];
+let refreshActive = 0;
+const REFRESH_CONCURRENCY = 2;
+
+function queuePageRefresh(cacheKey, catUrl, priority) {
+  if (backgroundFetches.has(cacheKey)) return;
+  if (refreshQueue.some((j) => j.cacheKey === cacheKey)) return;
+  refreshQueue.push({ cacheKey, catUrl, priority });
+  refreshQueue.sort((a, b) => a.priority - b.priority); // lower = sooner
+  pumpRefreshQueue();
+}
+
+function pumpRefreshQueue() {
+  while (refreshActive < REFRESH_CONCURRENCY && refreshQueue.length > 0) {
+    const job = refreshQueue.shift();
+    if (backgroundFetches.has(job.cacheKey)) continue;
+    refreshActive++;
+    backgroundFetchCategory(job.cacheKey, job.catUrl)
+      .catch(() => {})
+      .finally(() => { refreshActive--; setTimeout(pumpRefreshQueue, 500); });
+  }
+}
+
+// Queue a page for fetch if missing OR stale — page-1 of each feed gets top priority
+function ensurePageFresh(catKey, page, priority) {
+  const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
+  if (!catUrl) return;
+  const cacheKey = catKey + ":" + page;
+  const entry = feedCache.pages[cacheKey];
+  const missing = !entry || !entry.cards || entry.cards.length === 0;
+  const stale = !missing && (Date.now() - (entry.ts || 0) >= CACHE_MS);
+  if (missing || stale) {
+    const pUrl = page <= 1 ? catUrl : catUrl + "/" + page;
+    queuePageRefresh(cacheKey, pUrl, priority);
   }
 }
 
@@ -491,100 +625,88 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
 
 // Helper: get mixed videos from main feeds for the "all" homepage
 const MAIN_FEED_KEYS = ["newest", "popular", "top", "hd", "longest", "hot"];
-function getMixedVideos(page) {
-  const allCards = [];
+function getMixedVideos() {
+  const byId = new Map();
   for (const catKey of MAIN_FEED_KEYS) {
-    const cacheKey = catKey + ":" + page;
-    const entry = feedCache.pages[cacheKey];
-    if (entry && entry.cards) allCards.push(...entry.cards);
+    for (let p = 1; p <= 5; p++) {
+      const entry = feedCache.pages[catKey + ":" + p];
+      if (!entry || !entry.cards) continue;
+      for (const card of entry.cards) {
+        const id = card.id || card.pageUrl;
+        if (id && !byId.has(id)) byId.set(id, card); // dedupe across feeds
+      }
+    }
   }
-  return allCards;
+  return [...byId.values()];
 }
 
-// GET /api/videos — NEVER blocks on relay, returns cache immediately
+// Fisher–Yates shuffle (crypto-random) — a NEW order on every request
+function shuffleArray(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// GET /api/videos — NEVER blocks on network, returns cache immediately
 app.get("/api/videos", (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
-    const catKey = (req.query.category || "newest").toLowerCase();
-    const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
+    const catKey = (req.query.category || "all").toLowerCase();
+    const PAGE_SIZE = 36;
 
-    // Handle "all" category — mix from main feeds only
-    if (catKey === "all") {
-      const cards = getMixedVideos(page);
-      // Background-fetch missing pages for main feeds
+    // Handle "all" category — mixed + DEDUPED + RANDOM pool, different on every request
+    if (catKey === "all" || !CATEGORIES[catKey]) {
+      const pool = getMixedVideos();
+      const shuffled = pool.length > 0 ? shuffleArray(pool) : [];
+      const start = (page - 1) * PAGE_SIZE;
+      const cards = shuffled.slice(start, start + PAGE_SIZE);
+      // Keep main-feed pages fresh: page-1 first, then deeper pages
       for (const ck of MAIN_FEED_KEYS) {
-        for (let p = page; p <= page + 1; p++) {
-          const cacheKey = ck + ":" + p;
-          const entry = feedCache.pages[cacheKey];
-          if ((!entry || !entry.cards || entry.cards.length === 0) && !backgroundFetches.has(cacheKey)) {
-            const pUrl = p <= 1 ? CATEGORIES[ck] : CATEGORIES[ck] + "/" + p;
-            backgroundFetchCategory(cacheKey, pUrl).catch(() => {});
-          }
+        for (let p = 1; p <= 5; p++) {
+          ensurePageFresh(ck, p, p === 1 ? ck === "newest" ? 0 : 1 : 10 + p);
         }
       }
-      // AUTO-FETCH streams for all mixed cards (fire-and-forget)
-      if (cards.length > 0) autoFetchStreamsForCards(cards).catch(() => {});
+      res.set("Cache-Control", "no-store"); // every request = a new random shuffle
       return res.json({
         success: true,
         page,
         category: "all",
         count: cards.length,
-        totalPages: Object.keys(feedCache.pages).length,
+        totalPool: pool.length,
         videos: enrichCardsWithStreams(cards),
         cached: true,
-        fetching: backgroundFetches.size > 0,
+        fetching: backgroundFetches.size > 0 || refreshQueue.length > 0,
       });
     }
 
-    // Normal category
+    // Normal category — natural source order (Newest stays newest, etc.)
+    const catUrl = CATEGORIES[catKey];
     const cacheKey = catKey + ":" + page;
     const pageEntry = feedCache.pages[cacheKey];
     const hasCache = pageEntry && pageEntry.cards && pageEntry.cards.length > 0;
     const fresh = hasCache && (Date.now() - pageEntry.ts < CACHE_MS);
 
-    // Return whatever we have immediately
     const cards = (pageEntry && pageEntry.cards) || [];
     res.json({
       success: true,
       page,
       category: catKey,
       count: cards.length,
-      totalPages: Object.keys(feedCache.pages).length,
       videos: enrichCardsWithStreams(cards),
       cached: !!fresh,
-      fetching: backgroundFetches.has(catKey),
+      fetching: backgroundFetches.has(cacheKey) || refreshQueue.some((j) => j.cacheKey === cacheKey),
     });
 
-    // AUTO-FETCH streams for cards without cached streams (fire-and-forget)
-    if (cards.length > 0) autoFetchStreamsForCards(cards).catch(() => {});
-
-    // Trigger background fetch if cache is missing/stale — ANY page, not just page 1
-    if (!fresh && !backgroundFetches.has(cacheKey)) {
-      const pUrl = page <= 1 ? catUrl : catUrl + "/" + page;
-      backgroundFetchCategory(cacheKey, pUrl).catch(() => {});
-    }
-    // Pre-fetch next 5 pages for paginated view
-    for (let np = page + 1; np <= page + 5; np++) {
-      const nextKey = catKey + ":" + np;
-      const nextEntry = feedCache.pages[nextKey];
-      if ((!nextEntry || !nextEntry.cards || nextEntry.cards.length === 0) && !backgroundFetches.has(nextKey)) {
-        const npUrl = catUrl + "/" + np;
-        backgroundFetchCategory(nextKey, npUrl).catch(() => {});
-      }
-    }
+    // Refresh stale/missing pages gently (paced queue), current + next pages
+    ensurePageFresh(catKey, page, page <= 1 ? 0 : 5);
+    for (let np = page + 1; np <= page + 2; np++) ensurePageFresh(catKey, np, 10 + np);
   } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
 });
 
 app.get("/api/categories", (req, res) => res.json({ success: true, categories: Object.keys(CATEGORIES) }));
-
-// Bulk stream map — returns all cached m3u8 URLs so frontend can play instantly
-app.get("/api/stream-map", (req, res) => {
-  const map = {};
-  for (const [url, entry] of Object.entries(streamCache)) {
-    if (entry.m3u8Url) map[url] = entry.m3u8Url;
-  }
-  res.json({ success: true, count: Object.keys(map).length, streams: map });
-});
 
 // Full category list grouped by type for sidebar — DYNAMIC from all 582+ categories
 app.get("/api/categories/full", (req, res) => {
@@ -675,21 +797,12 @@ app.get("/api/videos/pages", (req, res) => {
     const catKey = (req.query.category || "newest").toLowerCase();
     const allVideos = [];
     for (let p = from; p <= to; p++) {
-      const cacheKey = catKey + ":" + p;
-      const entry = feedCache.pages[cacheKey];
+      const entry = feedCache.pages[catKey + ":" + p];
       if (entry && entry.cards) allVideos.push(...entry.cards);
     }
-    res.json({ success: true, from, to, category: catKey, count: allVideos.length, videos: allVideos });
-    // Trigger background fetch for missing pages
-    const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
-    for (let p = from; p <= to; p++) {
-      const cacheKey = catKey + ":" + p;
-      const entry = feedCache.pages[cacheKey];
-      if (!entry || !entry.cards || entry.cards.length === 0) {
-        const pUrl = p <= 1 ? catUrl : catUrl + "/" + p;
-        backgroundFetchCategory(cacheKey, pUrl).catch(() => {});
-      }
-    }
+    res.json({ success: true, from, to, category: catKey, count: allVideos.length, videos: enrichCardsWithStreams(allVideos) });
+    // Queue refresh for stale/missing pages (paced)
+    for (let p = from; p <= to; p++) ensurePageFresh(catKey, p, p <= 1 ? 0 : 10 + p);
   } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
 });
 
@@ -698,15 +811,13 @@ app.post("/api/batch-pages", rateLimit(60 * 1000, 20), async (req, res) => {
     const { category, from, to } = req.body;
     if (!category) return res.status(400).json({ error: "category required" });
     const catKey = category.toLowerCase();
-    const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
     const start = Math.max(1, from || 1);
     const end = Math.min(start + 9, to || start + 4); // max 10 pages
     const allVideos = [];
     const missingPages = [];
 
     for (let p = start; p <= end; p++) {
-      const cacheKey = catKey + ":" + p;
-      const entry = feedCache.pages[cacheKey];
+      const entry = feedCache.pages[catKey + ":" + p];
       if (entry && entry.cards && entry.cards.length > 0) {
         allVideos.push(...entry.cards);
       } else {
@@ -715,51 +826,16 @@ app.post("/api/batch-pages", rateLimit(60 * 1000, 20), async (req, res) => {
     }
 
     // Return cached immediately
-    res.json({ success: true, category: catKey, from: start, to: end, count: allVideos.length, videos: allVideos, missingPages });
+    res.json({ success: true, category: catKey, from: start, to: end, count: allVideos.length, videos: enrichCardsWithStreams(allVideos), missingPages });
 
-    // Background-fetch all missing pages in parallel
-    for (const p of missingPages) {
-      const cacheKey = catKey + ":" + p;
-      if (!backgroundFetches.has(cacheKey)) {
-        const pUrl = p <= 1 ? catUrl : catUrl + "/" + p;
-        backgroundFetchCategory(cacheKey, pUrl).catch(() => {});
-      }
-    }
-  } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
-});
-
-app.post("/api/prefetch", rateLimit(60 * 1000, 30), async (req, res) => {
-  try {
-    const urls = req.body.urls;
-    if (!Array.isArray(urls) || urls.length === 0) return res.status(400).json({ error: "urls array required" });
-    const batch = urls.slice(0, 50);
-    const results = {};
-    const CONCURRENCY = 10;
-    for (let i = 0; i < batch.length; i += CONCURRENCY) {
-      const chunk = batch.slice(i, i + CONCURRENCY);
-      await Promise.all(chunk.map(async (videoUrl) => {
-        const cached = streamCache[videoUrl];
-        if (cached && (Date.now() - cached.ts < STREAM_CACHE_MS)) { results[videoUrl] = { m3u8Url: cached.m3u8Url, cached: true }; return; }
-        try {
-          const m3u8Url = await fetchVideoPageForStream(videoUrl);
-          if (m3u8Url) {
-            results[videoUrl] = { m3u8Url, cached: false };
-            const keys = Object.keys(streamCache);
-            if (keys.length >= STREAM_CACHE_MAX) { const sorted = keys.sort((a, b) => (streamCache[a].ts || 0) - (streamCache[b].ts || 0)); for (let j = 0; j < Math.ceil(STREAM_CACHE_MAX / 4); j++) delete streamCache[sorted[j]]; }
-            streamCache[videoUrl] = { ts: Date.now(), m3u8Url };
-          } else { results[videoUrl] = { m3u8Url: null, error: "No m3u8 found" }; }
-        } catch (e) { results[videoUrl] = { m3u8Url: null, error: e.message }; }
-      }));
-      if (i + CONCURRENCY < batch.length) await new Promise((r) => setTimeout(r, 400));
-    }
-    saveStreamCache();
-    res.json({ success: true, results });
+    // Queue refresh for missing pages (paced)
+    for (const p of missingPages) ensurePageFresh(catKey, p, p <= 1 ? 0 : 10 + p);
   } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
 });
 
 async function fetchSearchViaRelay(keyword, pageNum) {
   const url = "https://xhamster.com/search/" + encodeURIComponent(keyword) + "/" + pageNum;
-  return fetchViaRelayUrl(url);
+  return fetchPageHtml(url);
 }
 
 app.get("/api/videos/:id", (req, res) => {
@@ -786,14 +862,8 @@ app.get("/api/search", rateLimit(60 * 1000, 20), async (req, res) => {
     const hasCache = pageEntry && pageEntry.cards && pageEntry.cards.length > 0;
     const fresh = hasCache && (Date.now() - pageEntry.ts < SEARCH_CACHE_MS);
 
-    // Return whatever we have immediately, enriched with cached streams
-    const cards = ((pageEntry && pageEntry.cards) || []).map(card => {
-      const videoUrl = card.pageUrl ? (fullUrl(card.pageUrl) || card.pageUrl) : null;
-      if (videoUrl && streamCache[videoUrl] && streamCache[videoUrl].m3u8Url) {
-        return { ...card, stream: streamCache[videoUrl].m3u8Url };
-      }
-      return card;
-    });
+    // Return whatever we have immediately, enriched with FRESH cached streams only
+    const cards = enrichCardsWithStreams((pageEntry && pageEntry.cards) || []);
     res.json({ success: true, keyword, page, count: cards.length, videos: cards, cached: !!fresh });
 
     // Background fetch if stale
@@ -803,8 +873,6 @@ app.get("/api/search", rateLimit(60 * 1000, 20), async (req, res) => {
         const newCards = parseCards(html);
         cache.pages[page] = { ts: Date.now(), cards: newCards };
         evictSearchCache();
-        // Auto-fetch streams for search results
-        autoFetchStreamsForCards(newCards).catch(() => {});
       } catch (e) {
         console.warn("[Search] Fetch failed:", e.message);
       }
@@ -812,111 +880,88 @@ app.get("/api/search", rateLimit(60 * 1000, 20), async (req, res) => {
   } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
 });
 
-app.get("/api/refresh", rateLimit(60 * 1000, 5), async (req, res) => {
+app.get("/api/refresh", rateLimit(60 * 1000, 10), async (req, res) => {
   const catKey = (req.query.category || "all").toLowerCase();
   try {
     if (catKey === "all") {
-      // Refresh categories in parallel batches of 6
-      const results = {};
-      const REFRESH_CONCURRENCY = 6;
-      for (let i = 0; i < CATEGORY_KEYS.length; i += REFRESH_CONCURRENCY) {
-        const batch = CATEGORY_KEYS.slice(i, i + REFRESH_CONCURRENCY);
-        await Promise.allSettled(batch.map(async (ck) => {
-          const catUrl = CATEGORIES[ck];
-          try {
-            const html = await fetchViaRelayUrl(catUrl);
-            const cards = parseCards(html);
-            feedCache.pages[ck + ":1"] = { ts: Date.now(), cards };
-            results[ck] = cards.length;
-            console.log("[Refresh]", ck + ":", cards.length, "videos");
-          } catch (e) {
-            results[ck] = 0;
-            console.warn("[Refresh] Failed:", ck, e.message);
-          }
-        }));
+      // Queue a paced refresh of all main-feed pages (page-1 first); respond immediately
+      for (let p = 1; p <= 5; p++) {
+        for (const feedKey of MAIN_FEED_KEYS) {
+          ensurePageFresh(feedKey, p, p === 1 ? (feedKey === "newest" ? 0 : 1) : 10 + p);
+        }
       }
-      saveFeedCache();
-      return res.json({ success: true, results });
+      return res.json({ success: true, queued: true, message: "Main feeds refresh queued" });
     }
-    // Single category refresh
-    const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
-    const html = await fetchViaRelayUrl(catUrl);
-    const cards = parseCards(html);
-    feedCache.pages[catKey + ":1"] = { ts: Date.now(), cards };
-    saveFeedCache();
-    res.json({ success: true, category: catKey, count: cards.length });
+    // Single category refresh — queue page 1 at top priority
+    const resolved = CATEGORIES[catKey] ? catKey : "newest";
+    ensurePageFresh(resolved, 1, 0);
+    res.json({ success: true, queued: true, category: resolved });
   } catch (e) { res.status(502).json({ success: false, error: String(e.message || e) }); }
 });
 
-// Pre-buffer: fetch first HLS segment and cache the m3u8 + first .ts file
-app.get("/api/prebuffer", async (req, res) => {
-  try {
-    const videoUrl = req.query.url;
-    if (!videoUrl) return res.status(400).json({ error: "url parameter required" });
-    // Check if we already have this stream cached
-    const cached = streamCache[videoUrl];
-    if (cached && cached.m3u8Url && (Date.now() - cached.ts < STREAM_CACHE_MS)) {
-      return res.json({ success: true, m3u8Url: cached.m3u8Url, prebuffered: true, cached: true });
-    }
-    // Fetch the video page and extract m3u8
-    const m3u8Url = await fetchVideoPageForStream(videoUrl);
-    if (!m3u8Url) return res.json({ success: false, error: "No m3u8 found" });
-    // Cache it
-    const keys = Object.keys(streamCache);
-    if (keys.length >= STREAM_CACHE_MAX) {
-      const sorted = keys.sort((a, b) => (streamCache[a].ts || 0) - (streamCache[b].ts || 0));
-      for (let i = 0; i < Math.ceil(STREAM_CACHE_MAX / 4); i++) delete streamCache[sorted[i]];
-    }
-    streamCache[videoUrl] = { ts: Date.now(), m3u8Url };
-    saveStreamCache();
-    // Pre-fetch the first .ts segment in background (fire-and-forget)
-    prebufferSegment(m3u8Url).catch(() => {});
-    res.json({ success: true, m3u8Url, prebuffered: true, cached: false });
-  } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
-});
-
-// Pre-fetch first HLS segment for instant playback
-async function prebufferSegment(m3u8Url) {
-  try {
-    const proxied = "/api/stream?url=" + encodeURIComponent(m3u8Url);
-    const upstream = await fetch(proxied, { headers: { Accept: "*/*" }, redirect: "follow" });
-    if (!upstream.ok) return;
-    const body = await upstream.text();
-    // Extract first segment URL from playlist
-    const lines = body.split("\n").map(l => l.trim()).filter(Boolean);
-    for (const line of lines) {
-      if (!line.startsWith("#") && (line.endsWith(".ts") || line.includes(".ts?"))) {
-        // Pre-fetch first .ts segment — this makes playback instant
-        const segUrl = line.startsWith("http") ? line : new URL(line, m3u8Url).href;
-        const proxiedSeg = "/api/stream?url=" + encodeURIComponent(segUrl);
-        fetch(proxiedSeg, { headers: { Range: "bytes=0-1048575" } }).catch(() => {}); // 1MB prebuffer
-        break;
-      }
-    }
-  } catch (e) { /* ignore */ }
-}
-
+// Resolve the m3u8 for a video page — fresh cache-hit is instant; otherwise live race-resolve.
+// ?refresh=1 forces re-extraction (frontend error-recovery path).
+const streamResolving = new Map(); // url -> in-flight promise (dedupe concurrent requests)
 app.get("/api/stream-url", async (req, res) => {
   try {
     const videoUrl = req.query.url;
+    const forceRefresh = req.query.refresh === "1";
     if (!videoUrl) return res.status(400).json({ error: "url parameter required" });
-    const cached = streamCache[videoUrl];
-    if (cached && (Date.now() - cached.ts < STREAM_CACHE_MS)) return res.json({ success: true, m3u8Url: cached.m3u8Url, cached: true });
-    const m3u8Url = await fetchVideoPageForStream(videoUrl);
-    if (!m3u8Url) return res.json({ success: false, error: "No m3u8 stream found" });
-    const keys = Object.keys(streamCache);
-    if (keys.length >= STREAM_CACHE_MAX) { const sorted = keys.sort((a, b) => (streamCache[a].ts || 0) - (streamCache[b].ts || 0)); for (let i = 0; i < Math.ceil(STREAM_CACHE_MAX / 4); i++) delete streamCache[sorted[i]]; }
-    streamCache[videoUrl] = { ts: Date.now(), m3u8Url };
-    saveStreamCache();
+
+    if (!forceRefresh) {
+      const cached = streamCache[videoUrl];
+      if (isStreamFresh(cached)) {
+        return res.json({ success: true, m3u8Url: cached.m3u8Url, cached: true });
+      }
+    }
+
+    // Dedupe: if the same URL is already being resolved, wait for that result
+    let resolvePromise = streamResolving.get(videoUrl);
+    if (forceRefresh || !resolvePromise) {
+      resolvePromise = fetchVideoPageForStream(videoUrl)
+        .then((m3u8Url) => {
+          if (!m3u8Url) throw new Error("No m3u8 stream found");
+          cacheStream(videoUrl, m3u8Url); // latest URL always replaces the old one
+          saveStreamCache();
+          return m3u8Url;
+        })
+        .finally(() => streamResolving.delete(videoUrl));
+      streamResolving.set(videoUrl, resolvePromise);
+    }
+
+    const m3u8Url = await resolvePromise;
     res.json({ success: true, m3u8Url, cached: false });
-  } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
+  } catch (e) { res.status(502).json({ success: false, error: String(e.message || e) }); }
 });
 
-/* ---------- Thumbnail proxy (fixes CORS/network in Electron) ---------- */
+/* ---------- Thumbnail proxy (fixes CORS/network in Electron) + in-memory LRU ---------- */
 const THUMB_HOST = /^https:\/\/([\w-]+\.)*xhcdn\.com\//;
+const thumbLRU = new Map(); // url -> { buf, ctype, ts }
+const THUMB_LRU_MAX = 500;
+const THUMB_LRU_TTL = 30 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of thumbLRU) {
+    if (now - v.ts > THUMB_LRU_TTL) thumbLRU.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
+
 app.get("/api/thumb", async (req, res) => {
   const url = req.query.url;
   if (!url || !THUMB_HOST.test(url)) return res.status(400).json({ error: "invalid thumb url" });
+
+  // LRU hit — instant, no upstream round-trip
+  const hit = thumbLRU.get(url);
+  if (hit && Date.now() - hit.ts < THUMB_LRU_TTL) {
+    thumbLRU.delete(url); thumbLRU.set(url, hit); // refresh recency
+    res.set("Content-Type", hit.ctype);
+    res.set("Cache-Control", "public, max-age=31536000, immutable");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.set("Content-Length", hit.buf.length);
+    return res.end(hit.buf);
+  }
+
   try {
     const upstream = await fetch(url, {
       headers: { "User-Agent": UA, Referer: "https://xhamster.com/" },
@@ -924,16 +969,45 @@ app.get("/api/thumb", async (req, res) => {
     });
     if (!upstream.ok) return res.status(502).json({ error: "upstream " + upstream.status });
     const ctype = upstream.headers.get("content-type") || "image/webp";
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    // Store in LRU (evict oldest if over cap)
+    if (thumbLRU.size >= THUMB_LRU_MAX) {
+      const oldestKey = thumbLRU.keys().next().value;
+      if (oldestKey !== undefined) thumbLRU.delete(oldestKey);
+    }
+    thumbLRU.set(url, { buf, ctype, ts: Date.now() });
     res.set("Content-Type", ctype);
     res.set("Cache-Control", "public, max-age=31536000, immutable");
     res.set("Access-Control-Allow-Origin", "*");
-    const cl = upstream.headers.get("content-length");
-    if (cl) res.set("Content-Length", cl);
-    Readable.fromWeb(upstream.body).pipe(res);
+    res.set("Content-Length", buf.length);
+    res.end(buf);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
 const ALLOWED_HOST = /^https:\/\/([\w-]+\.)*(xhcdn|phncdn|xhamster)\.com\//;
+
+// VOD playlists are immutable — cache raw bodies so repeat plays skip upstream RTTs
+const playlistLRU = new Map(); // url -> { body, ctype, ts }
+const PLAYLIST_LRU_MAX = 300;
+const PLAYLIST_TTL = 10 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of playlistLRU) if (now - v.ts > PLAYLIST_TTL) playlistLRU.delete(k);
+}, 5 * 60 * 1000).unref();
+
+function rewritePlaylistLine(line, baseUrl) {
+  const t = line.trim();
+  if (!t) return line;
+  if (t.startsWith("#")) {
+    // Rewrite URI="..." attributes (#EXT-X-KEY, #EXT-X-MAP, ...) — must handle
+    // RELATIVE URIs too, or hls.js resolves them against /api/stream and 404s
+    return t.replace(/URI="([^"]+)"/g, (m, u) => {
+      try { return 'URI="/api/stream?url=' + encodeURIComponent(new URL(u, baseUrl).href) + '"'; } catch (e) { return m; }
+    });
+  }
+  try { return "/api/stream?url=" + encodeURIComponent(new URL(t, baseUrl).href); } catch (e) { return line; }
+}
+
 app.get("/api/stream", async (req, res) => {
   const url = req.query.url;
   if (!url || !ALLOWED_HOST.test(url)) return res.status(400).json({ error: "invalid url" });
@@ -950,10 +1024,21 @@ app.get("/api/stream", async (req, res) => {
     const cl = upstream.headers.get("content-length");
     if (cl) res.set("Content-Length", cl);
     if (upstream.headers.get("content-range")) { res.status(206); res.set("Content-Range", upstream.headers.get("content-range")); }
-    const isPlaylist = /mpegurl|m3u8/i.test(ctype) || /\.m3u8($|\?)/.test(url);
+    const isPlaylist = /mpegurl/i.test(ctype) || /\.m3u8/i.test(url);
     if (isPlaylist) {
-      const body = await upstream.text();
-      return res.send(body.split("\n").map((line) => { const t = line.trim(); if (!t || t.startsWith("#")) return line; try { return "/api/stream?url=" + encodeURIComponent(new URL(t, url).href); } catch (e) { return line; } }).join("\n"));
+      let body = null;
+      const cachedPl = playlistLRU.get(url);
+      if (cachedPl && Date.now() - cachedPl.ts < PLAYLIST_TTL) {
+        body = cachedPl.body;
+      } else {
+        body = await upstream.text();
+        if (playlistLRU.size >= PLAYLIST_LRU_MAX) {
+          const oldest = playlistLRU.keys().next().value;
+          if (oldest !== undefined) playlistLRU.delete(oldest);
+        }
+        playlistLRU.set(url, { body, ctype, ts: Date.now() });
+      }
+      return res.send(body.split("\n").map((line) => rewritePlaylistLine(line, url)).join("\n"));
     }
     Readable.fromWeb(upstream.body).pipe(res);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
@@ -986,24 +1071,16 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-/* ---------- Auto refresh (cron) ---------- */
-const REFRESH_CRON = process.env.REFRESH_CRON || "*/30 * * * *";
+/* ---------- Auto refresh (cron) — main feeds only, gentle paced load ---------- */
+const REFRESH_CRON = process.env.REFRESH_CRON || "*/15 * * * *";
 async function autoRefresh() {
-  console.log("[Cron] Auto-refreshing feed...");
-  const CRON_CONCURRENCY = 8;
-  for (let i = 0; i < Object.entries(CATEGORIES).length; i += CRON_CONCURRENCY) {
-    const batch = Object.entries(CATEGORIES).slice(i, i + CRON_CONCURRENCY);
-    await Promise.allSettled(batch.map(async ([catKey, catUrl]) => {
-      try {
-        const html = await fetchViaRelayUrl(catUrl);
-        const cards = parseCards(html);
-        feedCache.pages[catKey + ":1"] = { ts: Date.now(), cards };
-        console.log("[Cron]", catKey + ":", cards.length, "videos");
-      } catch (e) { console.warn("[Cron] Failed:", catKey, e.message); }
-    }));
+  console.log("[Cron] Refreshing main feeds...");
+  // Interleaved: page-1 of every feed first, then deeper pages (via priority queue)
+  for (let p = 1; p <= 5; p++) {
+    for (const feedKey of MAIN_FEED_KEYS) {
+      ensurePageFresh(feedKey, p, p === 1 ? 0 : p);
+    }
   }
-  saveFeedCache();
-  console.log("[Cron] Feed refreshed");
 }
 
 module.exports = { parseCards, fetchViaRelayUrl, parseInitialsJson, extractM3u8FromHtml };
@@ -1024,90 +1101,35 @@ process.on("exit", () => { /* sync cleanup — best effort */ });
 /* ---------- Graceful shutdown ---------- */
 function gracefulShutdown(signal) {
   console.log("[Shutdown] Received", signal + " — cleaning up...");
-  saveFeedCache();
-  saveStreamCache();
+  flushCaches();
   cleanupBrowser().finally(() => process.exit(0));
 }
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-
-/* ---------- Startup auto-seed + pre-seed streams ---------- */
-async function preseedStreams(maxVideos) {
-  // Pre-seed streams for ALL main feed pages (5 pages for paginated view)
-  const allVideoUrls = [];
-  const MAX = maxVideos || 500;
-  const mainFeeds = ["newest", "popular", "top", "hd", "longest", "hot"];
-  for (const feedKey of mainFeeds) {
-    for (let p = 1; p <= 5; p++) {
-      const cacheKey = feedKey + ":" + p;
-      const entry = feedCache.pages[cacheKey];
-      if (!entry || !entry.cards) continue;
-      for (const card of entry.cards) {
-        if (allVideoUrls.length >= MAX) break;
-        const videoUrl = card.pageUrl ? (fullUrl(card.pageUrl) || card.pageUrl) : null;
-        if (videoUrl && !streamCache[videoUrl]) {
-          allVideoUrls.push(videoUrl);
-        }
-      }
-      if (allVideoUrls.length >= MAX) break;
-    }
-    if (allVideoUrls.length >= MAX) break;
-  }
-  if (allVideoUrls.length === 0) {
-    console.log("[Preseed] All streams already cached — nothing to do");
-    return;
-  }
-  console.log("[Preseed] Pre-seeding streams for", allVideoUrls.length, "videos (max", MAX, ")...");
-  let done = 0;
-  const BATCH = 5; // small batches to keep event loop responsive
-  for (let i = 0; i < allVideoUrls.length; i += BATCH) {
-    const batch = allVideoUrls.slice(i, i + BATCH);
-    await Promise.allSettled(batch.map(async (url) => {
-      try {
-        const html = await fetchViaRelayUrl(url);
-        const m3u8 = extractM3u8FromHtml(html);
-        if (m3u8) {
-          streamCache[url] = { ts: Date.now(), m3u8Url: m3u8 };
-          done++;
-        }
-      } catch (e) { /* skip */ }
-    }));
-    saveStreamCache();
-    await new Promise(r => setTimeout(r, 300));
-  }
-  saveStreamCache();
-  console.log("[Preseed] Pre-seeded", done, "of", allVideoUrls.length, "streams");
-}
 
 function fullUrl(pageUrl) {
   if (!pageUrl) return null;
   return /^https?:\/\//.test(pageUrl) ? pageUrl : "https://xhamster.com" + pageUrl;
 }
 
+/* ---------- Startup: serve disk cache instantly, refresh stale pages gently ---------- */
 async function startupSeed() {
-  // DON'T AWAIT — everything runs as background tasks
-  // Server already has feed-cache.json + stream-cache.json loaded from disk
   const cachedCount = Object.keys(feedCache.pages).filter(k => {
     const e = feedCache.pages[k];
     return e && e.cards && e.cards.length > 0;
   }).length;
-  console.log("[Seed] Serving", cachedCount, "cached pages from disk — videos available immediately");
+  const staleCount = Object.keys(feedCache.pages).filter(k => {
+    const e = feedCache.pages[k];
+    return e && e.cards && e.cards.length > 0 && Date.now() - (e.ts || 0) >= CACHE_MS;
+  }).length;
+  console.log("[Seed] Serving", cachedCount, "cached pages from disk (" + staleCount + " stale — refreshing in background)");
 
-  // Background: fetch ONLY missing pages for main feeds (fire-and-forget)
-  const mainFeeds = ["newest", "popular", "top", "hd", "longest", "hot"];
-  for (const feedKey of mainFeeds) {
-    for (let p = 1; p <= 5; p++) {
-      const cacheKey = feedKey + ":" + p;
-      const entry = feedCache.pages[cacheKey];
-      if (!entry || !entry.cards || entry.cards.length === 0) {
-        const url = p <= 1 ? CATEGORIES[feedKey] : CATEGORIES[feedKey] + "/" + p;
-        backgroundFetchCategory(cacheKey, url).catch(() => {});
-      }
+  // Queue refresh of every stale main-feed page, page-1 first (paced, concurrency 2)
+  for (let p = 1; p <= 5; p++) {
+    for (const feedKey of MAIN_FEED_KEYS) {
+      ensurePageFresh(feedKey, p, p === 1 ? (feedKey === "newest" ? 0 : 1) : 10 + p);
     }
   }
-
-  // Background: pre-seed streams (fire-and-forget, limited concurrency)
-  preseedStreams().catch(() => {});
 }
 
 /* ---------- Start server ---------- */

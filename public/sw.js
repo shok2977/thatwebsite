@@ -1,11 +1,12 @@
 /*
- * TubeStream Service Worker — Zero-Loading Cache Layer
- * Caches thumbnails, API responses, static assets for offline-first experience
+ * TubeStream Service Worker — v6
+ * Caches ONLY static assets + thumbnails.
+ * Feed/search/stream-resolve APIs are network-only so the user always gets
+ * fresh random videos, and /api/stream is never intercepted (HLS ranges must
+ * pass through untouched — caching partial 206 responses corrupts playback).
  */
-const CACHE_NAME = "ts-v5";
-const STATIC_CACHE = "ts-static-v5";
-const THUMB_CACHE = "ts-thumbs-v5";
-const API_CACHE = "ts-api-v5";
+const STATIC_CACHE = "ts-static-v6";
+const THUMB_CACHE = "ts-thumbs-v6";
 
 // Static assets to pre-cache on install
 const PRECACHE_URLS = [
@@ -15,7 +16,7 @@ const PRECACHE_URLS = [
   "/vendor/hls.min.js",
 ];
 
-// Install — pre-cache shell
+// Never let an old SW serve a stale app shell after an update
 self.addEventListener("install", (e) => {
   e.waitUntil(
     caches.open(STATIC_CACHE)
@@ -24,92 +25,80 @@ self.addEventListener("install", (e) => {
   );
 });
 
-// Activate — clean old caches
 self.addEventListener("activate", (e) => {
   e.waitUntil(
     caches.keys().then((keys) =>
       Promise.all(
-        keys
-          .filter((k) => k !== CACHE_NAME && k !== STATIC_CACHE && k !== THUMB_CACHE && k !== API_CACHE)
-          .map((k) => caches.delete(k))
+        keys.filter((k) => k !== STATIC_CACHE && k !== THUMB_CACHE).map((k) => caches.delete(k))
       )
     ).then(() => self.clients.claim())
   );
 });
 
-// Fetch — routing strategy
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
+  const path = url.pathname;
 
-  // Thumbnails (xhamster CDN images) — Cache-First, long TTL
+  // HLS playlists + segments: ALWAYS pass through — no interception, ever.
+  if (path === "/api/stream") return;
+
+  // Feed/search/stream-resolve: network-only — fresh data on every request.
   if (
-    url.hostname.includes("xhcdn.com") ||
-    url.hostname.includes("phncdn.com") ||
-    e.request.destination === "image"
-  ) {
-    e.respondWith(cacheFirst(e.request, THUMB_CACHE, 30 * 24 * 3600));
+    path === "/api/videos" ||
+    path === "/api/search" ||
+    path === "/api/stream-url" ||
+    path === "/api/refresh" ||
+    path === "/api/batch-pages" ||
+    path === "/api/videos/pages"
+  ) return;
+
+  // Thumbnails: cache-first with 24h TTL (proxied images are stable per URL)
+  if (path === "/api/thumb") {
+    e.respondWith(thumbCacheFirst(e.request));
     return;
   }
 
-  // API responses — Stale-While-Revalidate
-  if (url.pathname.startsWith("/api/")) {
-    // Don't cache mutating endpoints
-    if (url.pathname === "/api/refresh" || url.pathname === "/api/prefetch") {
-      return;
-    }
-    e.respondWith(staleWhileRevalidate(e.request, API_CACHE));
-    return;
-  }
-
-  // HLS stream segments — Network-First (live content)
-  if (url.pathname === "/api/stream") {
-    e.respondWith(networkFirst(e.request, API_CACHE));
-    return;
-  }
-
-  // Static assets — Network-First (avoid stale cache issues)
+  // Static app shell: network-first (so deploys land), cache fallback offline
   if (
-    url.pathname === "/style.css" ||
-    url.pathname === "/app.js" ||
-    url.pathname === "/vendor/hls.min.js"
+    path === "/" ||
+    path === "/style.css" ||
+    path === "/app.js" ||
+    path === "/vendor/hls.min.js"
   ) {
     e.respondWith(networkFirst(e.request, STATIC_CACHE));
     return;
   }
 
-  // Everything else — Network-First
-  e.respondWith(networkFirst(e.request, STATIC_CACHE));
+  // Everything else (sidebar categories, stats, docs): pass through untouched
 });
 
-// Cache-First strategy
-async function cacheFirst(req, cacheName, maxAgeSeconds) {
-  const cache = await caches.open(cacheName);
+// Thumbnail cache-first with TTL
+async function thumbCacheFirst(req) {
+  const cache = await caches.open(THUMB_CACHE);
   const cached = await cache.match(req);
   if (cached) {
-    // Check age via headers
-    const dateHeader = cached.headers.get("sw-cached-at");
-    if (dateHeader) {
-      const age = (Date.now() - Number(dateHeader)) / 1000;
-      if (age > maxAgeSeconds) {
-        // Stale — revalidate in background
-        fetchAndCache(req, cache);
-      }
-    }
-    return cached;
+    const at = Number(cached.headers.get("sw-cached-at") || 0);
+    if (at && Date.now() - at < 24 * 3600 * 1000) return cached;
+    cache.delete(req); // stale — refetch
   }
-  return fetchAndCache(req, cache);
+  try {
+    const resp = await fetch(req);
+    if (resp.ok) {
+      const headers = new Headers(resp.headers);
+      headers.set("sw-cached-at", String(Date.now()));
+      const body = await resp.blob();
+      cache.put(req, new Response(body, { status: resp.status, statusText: resp.statusText, headers }));
+      return new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+    }
+    return resp;
+  } catch (err) {
+    const fallback = await cache.match(req);
+    if (fallback) return fallback;
+    return new Response("", { status: 504, statusText: "Offline" });
+  }
 }
 
-// Stale-While-Revalidate strategy
-async function staleWhileRevalidate(req, cacheName) {
-  const cache = await caches.open(cacheName);
-  const cached = await cache.match(req);
-  const networkPromise = fetchAndCache(req, cache);
-  if (cached) return cached;
-  return networkPromise;
-}
-
-// Network-First strategy
+// Network-first (static shell)
 async function networkFirst(req, cacheName) {
   try {
     const resp = await fetch(req);
@@ -123,27 +112,5 @@ async function networkFirst(req, cacheName) {
     const cached = await cache.match(req);
     if (cached) return cached;
     throw e;
-  }
-}
-
-// Fetch and cache a response
-async function fetchAndCache(req, cache) {
-  try {
-    const resp = await fetch(req);
-    if (resp.ok) {
-      const toCache = resp.clone();
-      // Add timestamp header for age checking
-      const headers = new Headers(toCache.headers);
-      headers.set("sw-cached-at", String(Date.now()));
-      const timedResponse = new Response(await toCache.blob(), {
-        status: toCache.status,
-        statusText: toCache.statusText,
-        headers,
-      });
-      cache.put(req, timedResponse);
-    }
-    return resp;
-  } catch (e) {
-    return new Response("[]", { status: 503, statusText: "Offline" });
   }
 }
