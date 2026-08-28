@@ -1,0 +1,107 @@
+Video Streaming Website with Instant Playback
+Build a video streaming website with MongoDB Atlas, infinite scrolling, instant video playback, and comprehensive API documentation while proxying xHamster content anonymously.
+
+Project Overview
+Build a video streaming website that:
+
+Extracts .m3u8 URLs from xHamster starting page previews
+Proxies all video content through our server (no direct xHamster references)
+Implements instant playback (0 waiting time) with background prefetching
+Features infinite scrolling for continuous video discovery
+Uses MongoDB Atlas for data storage
+Provides comprehensive API documentation
+Maintains complete anonymity (no xHamster branding visible)
+Architecture Questions
+Before proceeding, I need to clarify several important technical decisions:
+
+1. Technology Stack
+Backend: Node.js with Express or Fastify?
+Frontend: React, Next.js, or vanilla JavaScript?
+Video Player: Video.js, Plyr, or custom HTML5 player?
+API Documentation: Swagger/OpenAPI, Redoc, or custom?
+2. Video Discovery Method
+How should we initially discover the .m3u8 URLs from xHamster?
+Use web scraping (Playwright/Puppeteer)?
+Use the firecrawl-browser skill for interactive scraping?
+Manual input of starting URL?
+Automated cron job to discover new videos?
+3. Instant Playback Strategy
+For "0 waiting time", we need to pre-fetch/cache .m3u8 URLs. Which approach?
+Background prefetching using Playwright headless browser
+Pre-fetch when video appears in viewport
+Pre-fetch N videos ahead during scroll
+Server-side stream proxy with caching
+4. Data Storage Schema
+What data should we store in MongoDB?
+
+Video metadata (title, duration, thumbnail, etc.)
+.m3u8 stream URLs (cached)
+Video categories/tags
+User viewing history?
+Video analytics?
+5. API Endpoints Scope
+What API endpoints are needed?
+
+GET /api/videos (list with pagination)
+GET /api/videos/:id (single video details)
+GET /api/videos/:id/stream (proxied stream)
+POST /api/videos/refresh (refresh video URLs)
+GET /api/categories (video categories)
+GET /api/search (search videos)
+Authentication/Authorization endpoints?
+6. MongoDB Connection
+The provided connection string includes credentials. Should we:
+
+Use environment variables for security
+Store in .env file (excluded from git)
+Use MongoDB connection pooling
+Implementation Plan (Draft)
+Phase 1: Backend Setup
+Initialize Node.js project with Express
+Configure MongoDB Atlas connection
+Set up environment variables (.env)
+Create database models/schemas
+Phase 2: Video Discovery System
+Implement xHamster scraper (Playwright)
+Extract .m3u8 URLs from video pages
+Store video metadata in MongoDB
+Set up automated refresh mechanism
+Phase 3: API Development
+Create REST API endpoints
+Implement pagination for infinite scroll
+Build video stream proxy
+Add caching layer for instant playback
+Phase 4: Frontend Development
+Build responsive UI
+Implement infinite scroll component
+Integrate video player
+Add loading states and error handling
+Phase 5: API Documentation
+Set up Swagger/OpenAPI
+Document all endpoints
+Add examples and response schemas
+Create interactive API explorer
+Phase 6: Optimization
+Implement background prefetching
+Add CDN support for static assets
+Optimize database queries
+Add monitoring and logging
+Files to Create
+server.js - Main Express server
+.env - Environment variables
+models/Video.js - MongoDB video model
+routes/api.js - API route handlers
+services/scraper.js - xHamster scraping service
+services/proxy.js - Video stream proxy
+public/index.html - Frontend entry point
+public/js/app.js - Frontend JavaScript
+public/css/style.css - Styling
+api-docs/swagger.json - API documentation
+package.json - Dependencies
+Verification
+Test video extraction from xHamster
+Verify instant playback (measure load time)
+Test infinite scrolling
+Validate all API endpoints
+Confirm no xHamster branding visible
+Test MongoDB connection and queries

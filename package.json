@@ -1,0 +1,21 @@
+{
+  "name": "tubestream",
+  "version": "2.0.0",
+  "description": "Video streaming website with instant playback, infinite scroll, and MongoDB",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "docs": "echo 'API docs at http://localhost:3001/api-docs'"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.19.2",
+    "hls.js": "^1.5.13",
+    "mongoose": "^8.11.0",
+    "node-cron": "^3.0.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
