@@ -141,12 +141,12 @@ function parseStreamExpiry(url) {
 function isStreamFresh(entry, now) {
   if (!entry || !entry.m3u8Url) return false;
   now = now || Date.now();
-  if (now - (entry.ts || 0) >= STREAM_CACHE_MS) return false;
-  if (entry.exp && now > entry.exp - STREAM_EXPIRY_MARGIN_MS) return false;
-  // No stored exp — parse from URL as a safety net
-  const exp = entry.exp || parseStreamExpiry(entry.m3u8Url);
-  if (exp && now > exp - STREAM_EXPIRY_MARGIN_MS) return false;
-  return true;
+  // Token URLs live for hours (the end=/,epoch token embedded in the CDN url).
+  // Judge freshness by the TOKEN's own expiry — falling back to wall-clock age
+  // only when the URL carries no parseable token.
+  const exp = entry.exp || parseStreamExpiry(entry.m3u8Url) || 0;
+  if (exp) return now < exp - STREAM_EXPIRY_MARGIN_MS;
+  return now - (entry.ts || 0) < STREAM_CACHE_MS;
 }
 
 function purgeExpiredStreams() {
@@ -194,8 +194,8 @@ function loadCachesFromDisk() {
       const now = Date.now();
       let kept = 0;
       for (const [k, v] of Object.entries(loaded)) {
-        // Keep only entries that are still fresh — drops expired-token URLs from disk
-        if (v && v.m3u8Url && now - (v.ts || 0) < STREAM_CACHE_MS) { streamCache[k] = v; kept++; }
+        // Keep only entries that are still fresh (token-valid) — drops dead URLs from disk
+        if (v && v.m3u8Url && isStreamFresh(v)) { streamCache[k] = v; kept++; }
       }
       console.log("[StreamCache] Loaded", kept, "fresh of", Object.keys(loaded).length, "on disk");
     }
@@ -293,90 +293,147 @@ async function scrapeViaPlaywright(targetUrl) {
 }
 
 /* ---------- Jina relay fetch (with Playwright fallback) ---------- */
-const { exec } = require("child_process");
+const { execFile } = require("child_process");
 
-function fetchViaRelayCurl(url, timeoutSec) {
-  const timeout = timeoutSec || 8;
-  // Quote header value for shell (spaces in "X-Respond-With: html")
-  const cmd = `curl -s --max-time ${timeout} -H "X-Respond-With: html" "${url}"`;
+/* ---------- Direct fetch (fail-fast racer) ---------- */
+// execFile — no shell, so no Windows cmd.exe quoting pitfalls
+function curlFetch(args, timeoutMs) {
   return new Promise((resolve, reject) => {
-    exec(cmd, { timeout: timeout * 1000 + 2000, maxBuffer: 50 * 1024 * 1024 }, (err, stdout) => {
+    execFile("curl", args, { timeout: timeoutMs, maxBuffer: 50 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
       if (err) return reject(new Error("curl failed: " + (err.message || String(err))));
       resolve(stdout);
     });
   });
 }
 
-/* ---------- Direct fetch (fastest path, no relay round-trip) ---------- */
-function shellEscapeSingleQuoted(s) {
-  return String(s).replace(/'/g, `'\\''`);
+function fetchDirectCurl(url, timeoutSec) {
+  const timeout = timeoutSec || 3;
+  return curlFetch(
+    ["-s", "-L", "--compressed", "--max-time", String(timeout),
+     "-H", "User-Agent: " + UA,
+     "-H", "Accept: text/html,application/xhtml+xml",
+     "-H", "Accept-Language: en-US,en;q=0.9",
+     "-H", "Referer: https://xhamster.com/",
+     url],
+    timeout * 1000 + 2000
+  ).then((t) => { if (!isValidPageHtml(t)) throw new Error("direct: no initials"); return t; });
 }
 
-function fetchDirectCurl(url, timeoutSec) {
-  const timeout = timeoutSec || 7;
-  const safeUrl = shellEscapeSingleQuoted(url);
-  const cmd = `curl -s -L --compressed --max-time ${timeout} -H 'User-Agent: ${shellEscapeSingleQuoted(UA)}' -H 'Accept: text/html,application/xhtml+xml' -H 'Accept-Language: en-US,en;q=0.9' -H 'Referer: https://xhamster.com/' '${safeUrl}'`;
-  return new Promise((resolve, reject) => {
-    exec(cmd, { timeout: timeout * 1000 + 2000, maxBuffer: 50 * 1024 * 1024, windowsHide: true }, (err, stdout) => {
-      if (err) return reject(new Error("direct curl failed: " + (err.message || String(err))));
-      resolve(stdout);
+function isValidPageHtml(html, requireM3u8) {
+  if (typeof html !== "string" || html.length <= 5000 || !html.includes("window.initials")) return false;
+  // For video pages a render WITHOUT the stream manifest is useless — don't let
+  // it win the race over a racer that actually carries the m3u8.
+  return !requireM3u8 || html.includes(".m3u8");
+}
+
+function timedFetchText(url, headers, timeoutMs) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  return fetch(url, { headers, redirect: "follow", signal: ctrl.signal })
+    .then((r) => { if (!r.ok) throw new Error("http " + r.status); return r.text(); })
+    .finally(() => clearTimeout(t));
+}
+
+// r.jina.ai via curl — node-fetch gets 403 (TLS/UA fingerprinting), curl works.
+// noCache=true for video pages: jina otherwise caches a degraded render forever.
+function fetchJinaCurl(url, timeoutSec, noCache) {
+  const timeout = timeoutSec || 9;
+  const args = ["-s", "--max-time", String(timeout), "-H", "X-Respond-With: html"];
+  if (noCache) args.push("-H", "X-No-Cache: true");
+  args.push(RELAY_BASE + url);
+  return curlFetch(args, timeout * 1000 + 2000)
+    .then((t) => { if (!isValidPageHtml(t, noCache && /\/videos\//.test(url))) throw new Error("jina: invalid render"); return t; });
+}
+
+/* ---------- Global relay limiter — tiered semaphore ----------
+ * The relay (jina) slows under high parallel load, so concurrency is capped
+ * per tier: 0 = user clicks/search (up to 3), 1 = warmer (up to 2),
+ * 2 = feed refresh/cron (up to 1). Clicks always preempt queued background
+ * jobs, and total concurrent render requests never exceed 4.
+ */
+const RELAY_MAX_CONCURRENT = 4;
+const relayQueue = []; // { priority, resolve }
+let relayActive = 0;
+
+const TIER_CAPS = { 0: 3, 1: 2, 2: 1 };
+const tierActive = { 0: 0, 1: 0, 2: 0 };
+
+function pumpRelay() {
+  for (;;) {
+    let idx = -1;
+    let best = Infinity;
+    for (let i = 0; i < relayQueue.length; i++) {
+      const pr = relayQueue[i].priority;
+      const cap = TIER_CAPS[pr] || 1;
+      if (tierActive[pr] < cap && relayActive < RELAY_MAX_CONCURRENT && pr < best) {
+        best = pr; idx = i;
+      }
+    }
+    if (idx === -1) break;
+    const job = relayQueue.splice(idx, 1)[0];
+    tierActive[job.priority]++;
+    relayActive++;
+    job.resolve(() => {
+      tierActive[job.priority]--;
+      relayActive--;
+      pumpRelay();
     });
+  }
+}
+
+function acquireRelaySlot(priority) {
+  const tier = TIER_CAPS[priority] !== undefined ? priority : 1;
+  return new Promise((resolve) => {
+    relayQueue.push({ priority: tier, resolve });
+    pumpRelay();
   });
 }
 
-function isValidPageHtml(html) {
-  return typeof html === "string" && html.length > 5000 && html.includes("window.initials");
+async function withRelaySlot(priority, fn) {
+  const release = await acquireRelaySlot(priority);
+  try { return await fn(); } finally { release(); }
 }
 
-async function fetchViaRelayUrl(fullUrl) {
-  const relayUrl = RELAY_BASE + fullUrl;
-  let lastErr;
-  // Try relay via curl (avoids TLS fingerprinting)
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const html = await fetchViaRelayCurl(relayUrl, 8);
-      if (isValidPageHtml(html)) return html;
-      lastErr = new Error("relay returned no valid content (" + (html ? html.length : 0) + " bytes)");
-    } catch (e) { lastErr = e; }
-    if (attempt < 1) await new Promise((r) => setTimeout(r, 1500));
-  }
-  // Relay failed — try Playwright fallback (with overall timeout)
-  if (chromium) {
-    try {
-      console.log("[Playwright] Relay failed (" + (lastErr ? lastErr.message : "unknown") + ") — trying browser scrape of direct URL...");
-      const pwPromise = scrapeViaPlaywright(fullUrl);
-      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("Playwright timeout")), 40000));
-      const html = await Promise.race([pwPromise, timeoutPromise]);
-      if (html && html.includes("window.initials")) return html;
-      console.warn("[Playwright] No window.initials found in scraped page");
-    } catch (pwErr) {
-      console.warn("[Playwright] Scrape failed:", pwErr.message);
-    }
-  }
-  throw lastErr || new Error("relay fetch failed");
-}
-
-/* ---------- Race fetch: direct-first + relay in parallel, first valid wins ---------- */
-async function fetchPageHtml(url) {
-  // Promise.race where only VALID html resolves; first valid wins, loser ignored
-  const tryDirect = (async () => {
-    const html = await fetchDirectCurl(url, 7);
-    if (!isValidPageHtml(html)) throw new Error("direct: no initials");
-    return html;
-  })();
-  const tryRelay = (async () => {
-    // small head start for direct (usually much faster); relay starts right after
-    const html = await fetchViaRelayUrl(url);
-    if (!isValidPageHtml(html)) throw new Error("relay: no initials");
-    return html;
-  })();
+/* ---------- Race fetch: 3 parallel strategies, first VALID page wins ---------- */
+// direct xhamster is network-blocked here, so the relay racers do the real work;
+// racing them in parallel turns a 3-9s sequential worst case into the fastest path.
+// priority: 0 = user-facing (click/search), 1 = background (feed refresh/warmer)
+async function fetchPageHtml(url, priority, opts) {
+  // Tiers: 0 = user click/search, 1 = warmer, 2 = feed refresh/cron
+  const prio = priority === 0 ? 0 : priority === 1 ? 1 : priority === 2 ? 2 : 1;
+  const bypass = opts && opts.bypassLimiter;
+  const requireM3u8 = !!(opts && opts.requireM3u8);
+  const check = (t) => { if (!isValidPageHtml(t, requireM3u8)) throw new Error("invalid render"); return t; };
+  // Video pages: bypass jina's render cache — it can pin a degraded (stream-less) render forever
+  const viaJina = bypass
+    ? fetchJinaCurl(url, 9, requireM3u8)
+    : withRelaySlot(prio, () => fetchJinaCurl(url, 9, requireM3u8)).then(check);
+  const racers = [
+    // r.jina.ai — renders the page (beats Cloudflare), returns html
+    viaJina.then(check),
+    // allorigins mirror — plain server-side fetch; slower but independent of jina
+    timedFetchText("https://api.allorigins.win/raw?url=" + encodeURIComponent(url), { "User-Agent": UA }, 12000)
+      .then(check),
+    // direct curl — fails fast when blocked, wins big when not
+    fetchDirectCurl(url, 3).then(check),
+  ];
   try {
-    return await Promise.race([tryDirect, tryRelay]);
+    return await Promise.any(racers);
   } catch (e) {
-    // Both rejected — see if the other one eventually made it
-    const results = await Promise.allSettled([tryDirect, tryRelay]);
-    for (const r of results) if (r.status === "fulfilled") return r.value;
-    throw new Error("all fetch strategies failed: " + (e.message || e));
+    // All three failed — one sequential jina retry (transient failures happen),
+    // then Playwright as the last resort
+    try { return await (bypass ? fetchJinaCurl(url, 10) : withRelaySlot(prio, () => fetchJinaCurl(url, 10)))
+      .then(check); } catch (e2) { /* fall through */ }
+    if (chromium) {
+      try {
+        const html = await Promise.race([
+          scrapeViaPlaywright(url),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Playwright timeout")), 40000)),
+        ]);
+        if (html && html.includes("window.initials")) return html;
+      } catch (pwErr) { /* fall through */ }
+    }
+    throw new Error("all fetch strategies failed");
   }
 }
 
@@ -405,22 +462,39 @@ function parseInitialsJson(html) {
 }
 
 function extractM3u8FromHtml(html) {
+  const r = extractM3u8WithSource(html);
+  return r ? r.url : null;
+}
+
+function extractM3u8WithSource(html) {
+  // PRIMARY (new frontend "API"): xhamster's SSR payload embeds the player
+  // manifest as <link rel="preload" href="...m3u8" as="fetch"> — deterministic
+  // on every fresh render, so prefer it over everything else.
+  const linkPatterns = [
+    /<link\b[^>]*href="(https?:\/\/[^"]+?\.m3u8[^"]*)"[^>]*as="fetch"[^>]*>/i,
+    /<link\b[^>]*as="fetch"[^>]*href="(https?:\/\/[^"]+?\.m3u8[^"]*)"[^>]*>/i,
+    /<link\b[^>]*href="(https?:\/\/[^"]+?\.m3u8[^"]*)"/i,
+  ];
+  for (const pat of linkPatterns) {
+    const m = pat.exec(html);
+    if (m && m[1]) return { url: m[1], fromPreload: true };
+  }
   const obj = parseInitialsJson(html);
   if (obj) {
     const ps = obj.xplayerSettings || {};
     const vm = obj.videoModel || {};
     if (ps.sources && ps.sources.hls) {
-      if (ps.sources.hls.url) return ps.sources.hls.url;
-      if (ps.sources.hls.fallback) return ps.sources.hls.fallback;
+      if (ps.sources.hls.url) return { url: ps.sources.hls.url, fromPreload: false };
+      if (ps.sources.hls.fallback) return { url: ps.sources.hls.fallback, fromPreload: false };
     }
-    if (vm.hlsUrl) return vm.hlsUrl;
-    if (vm.videoUrl) return vm.videoUrl;
+    if (vm.hlsUrl) return { url: vm.hlsUrl, fromPreload: false };
+    if (vm.videoUrl) return { url: vm.videoUrl, fromPreload: false };
     if (Array.isArray(vm.sources)) {
-      for (const s of vm.sources) { if (s.url && /\.m3u8/i.test(s.url)) return s.url; }
+      for (const s of vm.sources) { if (s.url && /\.m3u8/i.test(s.url)) return { url: s.url, fromPreload: false }; }
     }
   }
   const patterns = [/\"(https?:\/\/[^\"]*\.m3u8[^\"]*)\"/gi];
-  for (const pat of patterns) { const m = pat.exec(html); if (m && m[1]) return m[1]; }
+  for (const pat of patterns) { const m = pat.exec(html); if (m && m[1]) return { url: m[1], fromPreload: false }; }
   return null;
 }
 
@@ -522,15 +596,78 @@ function parseCards(html) {
   return cards;
 }
 
-async function fetchVideoPageForStream(pageUrl) {
+async function fetchVideoPageForStream(pageUrl, priority) {
   const full = /^https?:\/\//.test(pageUrl) ? pageUrl : "https://xhamster.com" + pageUrl;
-  try {
-    // Direct-first race — usually resolves in well under 2s
-    const html = await fetchPageHtml(full);
-    return extractM3u8FromHtml(html);
-  } catch (e) {
-    throw new Error("Could not fetch video page: " + e.message);
+  const prio = priority === 0 ? 0 : 1;
+  let lastErr;
+  // Up to 2 extraction attempts. Every URL is deep-validated before it is
+  // returned or cached: master #EXTM3U → level with segments → FIRST SEGMENT
+  // magic bytes (ftyp/TS sync). A URL that passes but can't actually play
+  // (dead tokens, preview manifests) is caught here, not by the player.
+  // Validation races a 2.5s timer — a slow check must NOT delay the click;
+  // a timed-out URL is returned unvalidated (player recovery covers it).
+  // Per-attempt time budget — a stubborn strict attempt must not eat the whole click
+  const BUDGETS = [9000, 10000];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // Attempt 0: strict — only renders that actually carry an m3u8 may win the
+      // race. Attempt 1: loose — accept any valid page (old-format initials may
+      // still yield a stream, and preload-less renders recover via the retry).
+      const attemptWork = (async () => {
+        const html = await fetchPageHtml(full, prio, { requireM3u8: attempt === 0 });
+        const extracted = extractM3u8WithSource(html);
+        if (!extracted) { lastErr = new Error("no m3u8 in page"); return null; }
+        const m3u8Url = extracted.url;
+        // Preload-link URLs are xhamster's own SSR payload — authoritative, no
+        // deep validation needed. Just seed the master playlist cache in the
+        // background and return immediately (saves 1-2.5s on every resolve).
+        if (extracted.fromPreload) {
+          fetchUpstreamText(m3u8Url)
+            .then((b) => { if (b && b.includes("#EXTM3U")) cachePlaylist(m3u8Url, b); })
+            .catch(() => {});
+          return m3u8Url;
+        }
+        const verdict = await Promise.race([
+        (async () => {
+          const master = await fetchUpstreamText(m3u8Url);
+          if (!master || !master.includes("#EXTM3U")) return { ok: false };
+          const lvlLine = master.split("\n").map((l) => l.trim()).find((l) => l && !l.startsWith("#"));
+          if (!lvlLine) return { ok: false };
+          const lvlUrl = new URL(lvlLine, m3u8Url).href;
+          const level = await fetchUpstreamText(lvlUrl);
+          const segLine = level.split("\n").map((l) => l.trim()).reverse().find((l) => l && !l.startsWith("#") && !l.includes(".m3u8"));
+          if (!segLine) return { ok: false };
+          // fetch just the first bytes of the first segment and check it's real media
+          const segUrl = new URL(segLine, lvlUrl).href;
+          const segResp = await fetch(segUrl, { headers: { "User-Agent": UA, Referer: "https://xhamster.com/", Range: "bytes=0-2047" }, redirect: "follow" });
+          if (!segResp.ok && segResp.status !== 206) return { ok: false };
+          const reader = segResp.body.getReader();
+          const chunk = await reader.read();
+          reader.cancel().catch(() => {});
+          const sb = chunk && chunk.value ? Buffer.from(chunk.value) : Buffer.alloc(0);
+          // fMP4 media segments open with "styp" (init = "ftyp"), TS with 0x47 sync byte
+          const box = sb.slice(4, 8).toString("latin1");
+          const isMedia = sb.length > 512 &&
+            (box === "ftyp" || box === "styp" || box === "moof" || sb[0] === 0x47 || sb.indexOf(Buffer.from("moov")) !== -1);
+          if (!isMedia) return { ok: false };
+          cachePlaylist(m3u8Url, master);
+          cachePlaylist(lvlUrl, level);
+          return { ok: true };
+        })(),
+        new Promise((res) => setTimeout(() => res({ ok: null }), 2500)),
+      ]);
+      if (verdict.ok === false) { lastErr = new Error("m3u8 failed playback-validation"); return null; }
+      // ok === true → fully validated + cached; ok === null → timed out, return unvalidated
+      return m3u8Url;
+      })();
+      const result = await Promise.race([
+        attemptWork,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("attempt budget exhausted")), BUDGETS[attempt])),
+      ]);
+      if (result) return result;
+    } catch (e) { lastErr = e; }
   }
+  throw new Error("Could not fetch video page: " + (lastErr ? lastErr.message : "unknown"));
 }
 
 function evictSearchCache() {
@@ -567,7 +704,7 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
   backgroundFetches.add(cacheKey);
   try {
     console.log("[Background] Fetching", cacheKey, "...");
-    const html = await fetchPageHtml(catUrl);
+    const html = await fetchPageHtml(catUrl, 2);
     const cards = parseCards(html);
     if (cards.length > 0) {
       feedCache.pages[cacheKey] = { ts: Date.now(), cards };
@@ -584,7 +721,7 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
 /* ---------- Paced refresh queue (keeps relay load gentle) ---------- */
 const refreshQueue = [];
 let refreshActive = 0;
-const REFRESH_CONCURRENCY = 2;
+const REFRESH_CONCURRENCY = 1; // jina degrades under parallel load — sequential refresh is faster overall
 
 function queuePageRefresh(cacheKey, catUrl, priority) {
   if (backgroundFetches.has(cacheKey)) return;
@@ -657,12 +794,18 @@ app.get("/api/videos", (req, res) => {
     const catKey = (req.query.category || "all").toLowerCase();
     const PAGE_SIZE = 36;
 
-    // Handle "all" category — mixed + DEDUPED + RANDOM pool, different on every request
+    // Handle "all" category — WARM-FIRST random feed.
+    // Videos whose streams are already resolved are shown first, so every
+    // visible card is instantly playable (zero-wait feel); unwarmed videos
+    // pad the tail only if the warm pool is short. Order reshuffles per request.
     if (catKey === "all" || !CATEGORIES[catKey]) {
       const pool = getMixedVideos();
-      const shuffled = pool.length > 0 ? shuffleArray(pool) : [];
-      const start = (page - 1) * PAGE_SIZE;
-      const cards = shuffled.slice(start, start + PAGE_SIZE);
+      const warm = [], cold = [];
+      for (const c of pool) {
+        const u = c.pageUrl ? (fullUrl(c.pageUrl) || c.pageUrl) : null;
+        if (u && isStreamFresh(streamCache[u])) warm.push(c); else cold.push(c);
+      }
+      const cards = shuffleArray(warm).concat(shuffleArray(cold)).slice((page - 1) * PAGE_SIZE, (page - 1) * PAGE_SIZE + PAGE_SIZE);
       // Keep main-feed pages fresh: page-1 first, then deeper pages
       for (const ck of MAIN_FEED_KEYS) {
         for (let p = 1; p <= 5; p++) {
@@ -676,6 +819,7 @@ app.get("/api/videos", (req, res) => {
         category: "all",
         count: cards.length,
         totalPool: pool.length,
+        warmPool: warm.length,
         videos: enrichCardsWithStreams(cards),
         cached: true,
         fetching: backgroundFetches.size > 0 || refreshQueue.length > 0,
@@ -835,7 +979,7 @@ app.post("/api/batch-pages", rateLimit(60 * 1000, 20), async (req, res) => {
 
 async function fetchSearchViaRelay(keyword, pageNum) {
   const url = "https://xhamster.com/search/" + encodeURIComponent(keyword) + "/" + pageNum;
-  return fetchPageHtml(url);
+  return fetchPageHtml(url, 0); // user-initiated search — high priority
 }
 
 app.get("/api/videos/:id", (req, res) => {
@@ -911,28 +1055,293 @@ app.get("/api/stream-url", async (req, res) => {
     if (!forceRefresh) {
       const cached = streamCache[videoUrl];
       if (isStreamFresh(cached)) {
+        warmPlaylists(cached.m3u8Url).catch(() => {});
         return res.json({ success: true, m3u8Url: cached.m3u8Url, cached: true });
       }
     }
 
-    // Dedupe: if the same URL is already being resolved, wait for that result
+    // Dedupe: if the same URL is already being resolved, join it — but ALWAYS
+    // also race a fresh HIGH-priority resolve. The in-flight one may be a
+    // background (LOW) job still queued behind other work; a click must never
+    // wait for that queue. Loser result is discarded; winner is already cached.
     let resolvePromise = streamResolving.get(videoUrl);
-    if (forceRefresh || !resolvePromise) {
-      resolvePromise = fetchVideoPageForStream(videoUrl)
+    if (resolvePromise && !forceRefresh) {
+      const high = fetchVideoPageForStream(videoUrl, 0)
+        .then((m3u8Url) => { if (!m3u8Url) throw new Error("No m3u8 stream found"); cacheStream(videoUrl, m3u8Url); saveStreamCache(); warmPlaylists(m3u8Url).catch(() => {}); return m3u8Url; });
+      resolvePromise = Promise.race([resolvePromise.promise, high]);
+    }
+    if (forceRefresh || !streamResolving.has(videoUrl)) {
+      const entry = { startedAt: Date.now(), promise: null };
+      entry.promise = fetchVideoPageForStream(videoUrl, 0)
         .then((m3u8Url) => {
           if (!m3u8Url) throw new Error("No m3u8 stream found");
           cacheStream(videoUrl, m3u8Url); // latest URL always replaces the old one
           saveStreamCache();
+          // Fire-and-forget: warm remaining level playlists so hls.js requests hit cache
+          warmPlaylists(m3u8Url).catch(() => {});
           return m3u8Url;
         })
-        .finally(() => streamResolving.delete(videoUrl));
-      streamResolving.set(videoUrl, resolvePromise);
+        .finally(() => { if (streamResolving.get(videoUrl) === entry) streamResolving.delete(videoUrl); });
+      streamResolving.set(videoUrl, entry);
+      resolvePromise = entry.promise;
     }
 
     const m3u8Url = await resolvePromise;
     res.json({ success: true, m3u8Url, cached: false });
   } catch (e) { res.status(502).json({ success: false, error: String(e.message || e) }); }
 });
+
+/* ---------- Playlist warm (resolve-time, for the CLICKED video only) ---------- */
+async function fetchUpstreamText(url) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Referer: "https://xhamster.com/", Accept: "*/*" }, redirect: "follow" });
+  if (!r.ok) throw new Error("upstream " + r.status);
+  return r.text();
+}
+
+function cachePlaylist(url, body) {
+  if (playlistLRU.size >= PLAYLIST_LRU_MAX) {
+    const oldest = playlistLRU.keys().next().value;
+    if (oldest !== undefined) playlistLRU.delete(oldest);
+  }
+  playlistLRU.set(url, { body, ctype: "application/vnd.apple.mpegurl", ts: Date.now() });
+}
+
+// Warm a master playlist + its level variants into playlistLRU so that the
+// player's sequential master→level hops become cache-hits. Also pre-fetches the
+// init segment + first media segment of the smallest level (segmentLRU) — those
+// two sequential upstream hops are the biggest chunk of click-to-play latency.
+async function warmPlaylists(m3u8Url) {
+  try {
+    let body;
+    const cached = playlistLRU.get(m3u8Url);
+    if (cached && Date.now() - cached.ts < PLAYLIST_TTL) {
+      body = cached.body; // master already validated+cached at resolve time
+    } else {
+      body = await fetchUpstreamText(m3u8Url);
+      cachePlaylist(m3u8Url, body);
+    }
+    const variants = [];
+    for (const line of body.split("\n")) {
+      const t = line.trim();
+      if (!t || t.startsWith("#")) continue;
+      try { variants.push(new URL(t, m3u8Url).href); } catch (e) { /* skip */ }
+      if (variants.length >= 8) break;
+    }
+    // concurrency-capped level warm
+    let idx = 0;
+    async function worker() {
+      while (idx < variants.length) {
+        const vUrl = variants[idx++];
+        try { cachePlaylist(vUrl, await fetchUpstreamText(vUrl)); } catch (e) { /* skip */ }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(3, variants.length) }, worker));
+    // Pre-fetch init + first media segment of the smallest variant (fastest decode start)
+    const smallest = variants[0];
+    if (smallest) {
+      const lvl = playlistLRU.get(smallest);
+      if (lvl && lvl.body) {
+        const lines = lvl.body.split("\n").map((l) => l.trim()).filter(Boolean);
+        const initLine = lines.find((l) => l.startsWith("#") && /URI="([^"]+)"/.test(l));
+        if (initLine) {
+          const iu = /URI="([^"]+)"/.exec(initLine)[1];
+          try { await cacheSegment(new URL(iu, smallest).href); } catch (e) { /* skip */ }
+        }
+        const segLine = lines.reverse().find((l) => !l.startsWith("#") && !l.includes(".m3u8"));
+        if (segLine) {
+          try { await cacheSegment(new URL(segLine, smallest).href, 262144); } catch (e) { /* skip */ }
+        }
+      }
+    }
+  } catch (e) { /* warming is best-effort */ }
+}
+
+/* ---------- Segment LRU — init + first media segments for warmed videos ---------- */
+const segmentLRU = new Map(); // url -> { buf, ts }
+const SEGMENT_LRU_MAX = 100;
+const SEGMENT_TTL = 30 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of segmentLRU) if (now - v.ts > SEGMENT_TTL) segmentLRU.delete(k);
+}, 5 * 60 * 1000).unref();
+
+function cacheSegmentUrl(url, buf) {
+  if (segmentLRU.size >= SEGMENT_LRU_MAX) {
+    const oldest = segmentLRU.keys().next().value;
+    if (oldest !== undefined) segmentLRU.delete(oldest);
+  }
+  segmentLRU.set(url, { buf, ts: Date.now() });
+}
+
+async function cacheSegment(url, maxBytes) {
+  const r = await fetch(url, { headers: { "User-Agent": UA, Referer: "https://xhamster.com/", Accept: "*/*", ...(maxBytes ? { Range: "bytes=0-" + (maxBytes - 1) } : {}) }, redirect: "follow" });
+  if (!r.ok && r.status !== 206) return false;
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done || !value) break;
+    chunks.push(Buffer.from(value));
+    total += value.length;
+    if (total >= (maxBytes || 512 * 1024)) { reader.cancel().catch(() => {}); break; }
+    if (total > 512 * 1024) { reader.cancel().catch(() => {}); break; } // don't cache huge segments
+  }
+  const buf = Buffer.concat(chunks);
+  if (buf.length < 512) return false;
+  cacheSegmentUrl(url, buf);
+  return true;
+}
+
+/* ---------- Gentle visible-page warmer ----------
+ * Frontend sends the current page's video URLs; the server resolves TWO streams
+ * at a time (staggered 1.5s) so that clicking any visible video is a cache-hit.
+ * Strictly bounded — nothing like the old 20-parallel/500-preseed prefetch engine.
+ */
+const warmQueue = [];
+const warmRetried = new Set();
+let warmActive = 0;
+const WARM_WORKERS = 2;          // 2 concurrent = visible page warm in ~20s without degrading jina
+const WARM_STAGGER_MS = 800;
+const WARM_QUEUE_MAX = 60;
+
+app.post("/api/warm", rateLimit(60 * 1000, 20), (req, res) => {
+  try {
+    const urls = req.body && req.body.urls;
+    if (!Array.isArray(urls)) return res.status(400).json({ error: "urls array required" });
+    // New page render = the user navigated; the old page's queue is stale. Flush it
+    // so background load stays proportional to what's actually on screen.
+    warmQueue.length = 0;
+    const valid = urls.slice(0, 12).filter((u) =>
+      typeof u === "string" && /^https:\/\/xhamster\.com\/videos\//.test(u) && !isStreamFresh(streamCache[u])
+    );
+    // URGENT: first 3 cards resolve back-to-back (sequential, high priority) — users
+    // overwhelmingly click one of the first visible cards, so those must be warm
+    // within a few seconds of page render even while the paced queue covers the rest.
+    const urgentUrls = valid.slice(0, 3).filter((u) => !streamResolving.has(u) && !warmQueue.includes(u));
+    let urgent = urgentUrls.length;
+    if (urgent > 0) {
+      // Urgent trio resolves IN PARALLEL (they're what the user is most likely
+      // to click in the next few seconds) — each via the tier-1 warmer slots.
+      for (const u of urgentUrls) {
+        const entry = { startedAt: Date.now(), promise: null };
+        entry.promise = (async () => {
+          const m3u8Url = await fetchVideoPageForStream(u, 1);
+          if (m3u8Url) { cacheStream(u, m3u8Url); saveStreamCache(); warmPlaylists(m3u8Url).catch(() => {}); }
+        })().finally(() => { if (streamResolving.get(u) === entry) streamResolving.delete(u); });
+        streamResolving.set(u, entry);
+        entry.promise.catch(() => { retryWarm(u); });
+      }
+    }
+    let queued = 0;
+    for (const u of valid) {
+      if (warmQueue.includes(u) || streamResolving.has(u)) continue;
+      if (warmQueue.length >= WARM_QUEUE_MAX) break;
+      warmQueue.push(u);
+      queued++;
+    }
+    pumpWarmQueue();
+    res.json({ success: true, queued, urgent });
+  } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
+});
+
+function pumpWarmQueue() {
+  while (warmActive < WARM_WORKERS && warmQueue.length > 0) {
+    const next = warmQueue.shift();
+    if (isStreamFresh(streamCache[next])) continue;
+    warmActive++;
+    (async () => {
+      try {
+        const m3u8Url = await fetchVideoPageForStream(next, 1);
+        if (m3u8Url) {
+          cacheStream(next, m3u8Url);
+          saveStreamCache();
+          warmPlaylists(m3u8Url).catch(() => {});
+        } else {
+          retryWarm(next);
+        }
+      } catch (e) {
+        retryWarm(next);
+      } finally {
+        warmActive--;
+        if (warmQueue.length > 0) setTimeout(pumpWarmQueue, WARM_STAGGER_MS);
+        else setTimeout(pumpWarmQueue, WARM_STAGGER_MS * 2); // poll for new arrivals
+      }
+    })();
+  }
+}
+
+// One retry per failed URL, requeued at the back (transient relay failures)
+function retryWarm(url) {
+  if (warmRetried.has(url)) { warmRetried.delete(url); return; }
+  warmRetried.add(url);
+  if (warmQueue.length < WARM_QUEUE_MAX) warmQueue.push(url);
+}
+
+/* ---------- WARM POOL — the zero-wait engine ----------
+ * A background worker keeps a rotating pool of main-feed videos with FRESH
+ * streams (m3u8 + playlists + first segments). The homepage serves warm
+ * videos FIRST, so every card the user sees is already playable — a click at
+ * ANY moment (even the second the page opens) is a cache-hit.
+ * Tokens live ~3h, so keeping ~60 warm costs one resolve every few seconds
+ * at most — negligible relay load.
+ */
+const WARM_POOL_TARGET = 60;
+let poolCursor = 0;
+let poolCycle = 0;
+
+function countWarmStreams() {
+  const now = Date.now();
+  let n = 0;
+  for (const v of Object.values(streamCache)) if (isStreamFresh(v, now)) n++;
+  return n;
+}
+
+// Round-robin unique main-feed video URLs; skips ones already warm
+function nextPoolCandidate() {
+  const urls = getMixedVideos()
+    .map((c) => c.pageUrl ? (fullUrl(c.pageUrl) || c.pageUrl) : null)
+    .filter(Boolean);
+  if (urls.length === 0) return null;
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[(poolCursor + i) % urls.length];
+    if (!isStreamFresh(streamCache[url]) && !streamResolving.has(url)) {
+      poolCursor = (poolCursor + i + 1) % urls.length;
+      return url;
+    }
+  }
+  return null; // everything warm (or resolving)
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function warmPoolWorker() {
+  console.log("[WarmPool] Worker started — target:", WARM_POOL_TARGET, "fresh streams");
+  for (;;) {
+    try {
+      const fresh = countWarmStreams();
+      if (fresh >= WARM_POOL_TARGET) {
+        await sleep(10000); // pool is full — idle check
+        continue;
+      }
+      const url = nextPoolCandidate();
+      if (!url) { await sleep(8000); continue; }
+      const entry = { startedAt: Date.now(), promise: null };
+      entry.promise = fetchVideoPageForStream(url, 1)
+        .then((m3u8Url) => {
+          if (m3u8Url) { cacheStream(url, m3u8Url); saveStreamCache(); warmPlaylists(m3u8Url).catch(() => {}); }
+        })
+        .finally(() => { if (streamResolving.get(url) === entry) streamResolving.delete(url); });
+      streamResolving.set(url, entry);
+      await entry.promise.catch(() => {});
+      poolCycle++;
+      if (poolCycle % 20 === 0) console.log("[WarmPool]", countWarmStreams(), "/", WARM_POOL_TARGET, "warm");
+      await sleep(500); // gentle pacing between resolves
+    } catch (e) {
+      await sleep(3000);
+    }
+  }
+}
 
 /* ---------- Thumbnail proxy (fixes CORS/network in Electron) + in-memory LRU ---------- */
 const THUMB_HOST = /^https:\/\/([\w-]+\.)*xhcdn\.com\//;
@@ -984,7 +1393,7 @@ app.get("/api/thumb", async (req, res) => {
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
 
-const ALLOWED_HOST = /^https:\/\/([\w-]+\.)*(xhcdn|phncdn|xhamster)\.com\//;
+const ALLOWED_HOST = /^https:\/\/([\w-]+\.)*(xhcdn|phncdn|xhamster|ahcdn)\.com\//;
 
 // VOD playlists are immutable — cache raw bodies so repeat plays skip upstream RTTs
 const playlistLRU = new Map(); // url -> { body, ctype, ts }
@@ -1040,6 +1449,18 @@ app.get("/api/stream", async (req, res) => {
       }
       return res.send(body.split("\n").map((line) => rewritePlaylistLine(line, url)).join("\n"));
     }
+    // Segment cache — warmed init/first segments serve instantly (no Range requests only)
+    if (!req.headers.range) {
+      const seg = segmentLRU.get(url);
+      if (seg && Date.now() - seg.ts < SEGMENT_TTL) {
+        res.set("Content-Type", "video/mp4");
+        res.set("Content-Length", seg.buf.length);
+        res.set("Cache-Control", "public, max-age=86400");
+        res.set("Access-Control-Allow-Origin", "*");
+        res.set("Accept-Ranges", "bytes");
+        return res.end(seg.buf);
+      }
+    }
     Readable.fromWeb(upstream.body).pipe(res);
   } catch (e) { res.status(500).json({ error: String(e.message || e) }); }
 });
@@ -1055,7 +1476,13 @@ app.use("/vendor", express.static(path.join(__dirname, "node_modules/hls.js/dist
   maxAge: "30d", etag: true, lastModified: true
 }));
 app.use(express.static(path.join(__dirname, "public"), {
-  maxAge: "1h", etag: true, lastModified: true
+  etag: true, lastModified: true,
+  setHeaders: (res, filePath) => {
+    // HTML must never be cached — stale index.html pins an old app.js and
+    // the user keeps running the previous build for up to an hour.
+    if (filePath.endsWith(".html")) res.set("Cache-Control", "no-store");
+    else res.set("Cache-Control", "public, max-age=3600");
+  }
 }));
 
 /* ---------- Root health check (API) ---------- */
@@ -1083,7 +1510,7 @@ async function autoRefresh() {
   }
 }
 
-module.exports = { parseCards, fetchViaRelayUrl, parseInitialsJson, extractM3u8FromHtml };
+module.exports = { parseCards, fetchPageHtml, parseInitialsJson, extractM3u8FromHtml };
 
 /* ---------- Browser cleanup ---------- */
 async function cleanupBrowser() {
@@ -1106,6 +1533,9 @@ function gracefulShutdown(signal) {
 }
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+// Log-and-continue guards — a stray async error must not kill the whole server
+process.on("uncaughtException", (e) => console.error("[FATAL-uncaught]", e && (e.stack || e.message || e)));
+process.on("unhandledRejection", (e) => console.error("[FATAL-unhandled]", e && (e.stack || e.message || e)));
 
 function fullUrl(pageUrl) {
   if (!pageUrl) return null;
@@ -1130,6 +1560,9 @@ async function startupSeed() {
       ensurePageFresh(feedKey, p, p === 1 ? (feedKey === "newest" ? 0 : 1) : 10 + p);
     }
   }
+
+  // Zero-wait engine: keep the homepage's visible videos stream-warm at all times
+  warmPoolWorker().catch((e) => console.warn("[WarmPool] Worker crashed:", e.message));
 }
 
 /* ---------- Start server ---------- */

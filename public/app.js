@@ -54,6 +54,9 @@
   // This is memoization of URLs already clicked, NOT prefetching.
   const resolvedStreams = new Map();
 
+  // Gentle warmer: URLs already sent to /api/warm this session (dedupe)
+  const warmSent = new Set();
+
   /* ========== SEARCH STATE ========== */
   let searchMode = false;
   let searchKeyword = "";
@@ -235,6 +238,20 @@
         });
       });
     });
+
+    // Gentle warmer: hand the current viewport's videos to the server's paced queue
+    // (1-at-a-time on the server) so clicking a visible video is a cache-hit.
+    const warmUrls = videos.slice(0, 12)
+      .map(v => fullUrl(v.pageUrl))
+      .filter(u => u && u !== "#" && !warmSent.has(u));
+    if (warmUrls.length > 0) {
+      warmUrls.forEach(u => warmSent.add(u));
+      fetch("/api/warm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ urls: warmUrls }),
+      }).catch(() => {});
+    }
   }
 
   /* ========== TOOLTIP PREVIEW (only for cards with a fresh server stream) ========== */
@@ -542,6 +559,32 @@
     if (currentVideo) resolveAndPlay(currentVideo, true);
   }
 
+  let playWatchdog = null;
+
+  function startPlayWatchdog() {
+    stopPlayWatchdog();
+    let ticks = 0;
+    playWatchdog = setInterval(() => {
+      if (modal.classList.contains("hidden")) { stopPlayWatchdog(); return; }
+      if (!player.paused && player.currentTime > 0.05) { stopPlayWatchdog(); return; }
+      if (++ticks > 30) { stopPlayWatchdog(); return; } // ~9s max
+      // Chrome sometimes leaves play() pending forever even with data buffered — nudge it
+      const p = player.play();
+      if (p && p.then) {
+        p.then(() => { if (player.muted) player.muted = false; })
+         .catch(() => {
+           // autoplay policy fallback: start muted, restore sound on first frame
+           player.muted = true;
+           player.play().then(() => { player.muted = false; }).catch(() => {});
+         });
+      }
+    }, 300);
+  }
+
+  function stopPlayWatchdog() {
+    if (playWatchdog) { clearInterval(playWatchdog); playWatchdog = null; }
+  }
+
   function playStream(url) {
     destroyHls();
     const proxied = "/api/stream?url=" + encodeURIComponent(url);
@@ -551,18 +594,23 @@
       if (typeof Hls !== "undefined" && Hls.isSupported()) {
         hls = new Hls({
           enableWorker: true,
-          startLevel: -1,
-          abrEwmaDefaultEstimate: 2000000, // assume decent bandwidth → decent start level, ABR ramps up
-          startFragPrefetch: true,         // grab the first fragment while the manifest finishes parsing
+          startLevel: 0, // start at the smallest rendition — first frame in ~0.3s, ABR ramps up
           maxBufferLength: 15,
           maxMaxBufferLength: 60,
-          backBufferLength: 15,
-          capLevelToPlayerSize: true,
         });
         hls.loadSource(proxied);
         hls.attachMedia(player);
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          player.play().catch(() => {});
+          const pp = player.play();
+          if (pp && pp.catch) pp.catch(() => {});
+          startPlayWatchdog();
+        });
+        hls.on(Hls.Events.FRAG_BUFFERED, () => {
+          // First data in buffer → nudge play() immediately (don't wait for watchdog ticks)
+          if (player.paused && !modal.classList.contains("hidden")) {
+            const p = player.play();
+            if (p && p.catch) p.catch(() => {});
+          }
         });
         hls.on(Hls.Events.ERROR, (e, data) => {
           if (data && data.fatal) {
@@ -576,12 +624,14 @@
       } else if (player.canPlayType("application/vnd.apple.mpegurl")) {
         player.src = proxied;
         player.play().catch(() => {});
+        startPlayWatchdog();
       } else {
         showPlayerError("HLS not supported in this browser");
       }
     } else {
       player.src = proxied;
       player.play().catch(() => {});
+      startPlayWatchdog();
     }
   }
 
@@ -592,6 +642,7 @@
   }
 
   function destroyHls() {
+    stopPlayWatchdog();
     if (hls) { try { hls.destroy(); } catch (e) {} hls = null; }
     player.removeAttribute("src");
     try { player.load(); } catch (e) {}
