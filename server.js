@@ -708,6 +708,7 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
     const cards = parseCards(html);
     if (cards.length > 0) {
       feedCache.pages[cacheKey] = { ts: Date.now(), cards };
+      enforceFeedCacheCap();
       saveFeedCache();
     }
     console.log("[Background]", cacheKey + ":", cards.length, "videos loaded");
@@ -744,14 +745,13 @@ function pumpRefreshQueue() {
 
 // Queue a page for fetch if missing OR stale — page-1 of each feed gets top priority
 function ensurePageFresh(catKey, page, priority) {
-  const catUrl = CATEGORIES[catKey] || CATEGORIES.newest;
-  if (!catUrl) return;
+  if (!/^[a-z0-9-]{2,60}$/.test(catKey)) return;
   const cacheKey = catKey + ":" + page;
   const entry = feedCache.pages[cacheKey];
   const missing = !entry || !entry.cards || entry.cards.length === 0;
   const stale = !missing && (Date.now() - (entry.ts || 0) >= CACHE_MS);
   if (missing || stale) {
-    const pUrl = page <= 1 ? catUrl : catUrl + "/" + page;
+    const pUrl = categoryUrl(catKey, page);
     queuePageRefresh(cacheKey, pUrl, priority);
   }
 }
@@ -787,8 +787,10 @@ function shuffleArray(arr) {
   return a;
 }
 
-// GET /api/videos — NEVER blocks on network, returns cache immediately
-app.get("/api/videos", (req, res) => {
+// GET /api/videos — "all" serves the warm-first random pool; REAL categories
+// fetch on demand at user priority so the first visit returns that
+// category's actual videos (never a random mix).
+app.get("/api/videos", async (req, res) => {
   try {
     const page = Math.max(1, parseInt(req.query.page) || 1);
     const catKey = (req.query.category || "all").toLowerCase();
@@ -798,7 +800,7 @@ app.get("/api/videos", (req, res) => {
     // Videos whose streams are already resolved are shown first, so every
     // visible card is instantly playable (zero-wait feel); unwarmed videos
     // pad the tail only if the warm pool is short. Order reshuffles per request.
-    if (catKey === "all" || !CATEGORIES[catKey]) {
+    if (catKey === "all") {
       const pool = getMixedVideos();
       const warm = [], cold = [];
       for (const c of pool) {
@@ -826,26 +828,43 @@ app.get("/api/videos", (req, res) => {
       });
     }
 
-    // Normal category — natural source order (Newest stays newest, etc.)
-    const catUrl = CATEGORIES[catKey];
+    // REAL category — sanitize and route honestly (unknown keys still try
+    // xhamster.com/categories/<key> instead of silently returning random videos)
+    if (!/^[a-z0-9-]{2,60}$/.test(catKey)) {
+      return res.status(400).json({ success: false, error: "invalid category" });
+    }
+    const catUrl = categoryUrl(catKey, page);
     const cacheKey = catKey + ":" + page;
     const pageEntry = feedCache.pages[cacheKey];
     const hasCache = pageEntry && pageEntry.cards && pageEntry.cards.length > 0;
     const fresh = hasCache && (Date.now() - pageEntry.ts < CACHE_MS);
 
-    const cards = (pageEntry && pageEntry.cards) || [];
+    let cards = (pageEntry && pageEntry.cards) || [];
+    // CACHE MISS → block briefly (max 7s) and fetch THIS category on demand
+    if (!cards.length) {
+      try {
+        const fetched = await Promise.race([
+          fetchCategoryNow(cacheKey, catUrl),
+          sleep(7000).then(() => null),
+        ]);
+        if (fetched && fetched.length) cards = fetched;
+      } catch (e) { /* fall through with empty + fetching flag */ }
+    } else if (!fresh) {
+      ensurePageFresh(catKey, page, 0); // stale → instant cache + background refresh
+    }
+
+    res.set("Cache-Control", "no-store");
     res.json({
       success: true,
       page,
       category: catKey,
       count: cards.length,
       videos: enrichCardsWithStreams(cards),
-      cached: !!fresh,
-      fetching: backgroundFetches.has(cacheKey) || refreshQueue.some((j) => j.cacheKey === cacheKey),
+      cached: !!fresh || cards.length > 0,
+      fetching: backgroundFetches.has(cacheKey) || refreshQueue.some((j) => j.cacheKey === cacheKey) || cards.length === 0,
     });
 
-    // Refresh stale/missing pages gently (paced queue), current + next pages
-    ensurePageFresh(catKey, page, page <= 1 ? 0 : 5);
+    // Warm neighbouring pages in the background (paced queue)
     for (let np = page + 1; np <= page + 2; np++) ensurePageFresh(catKey, np, 10 + np);
   } catch (e) { res.status(500).json({ success: false, error: String(e.message || e) }); }
 });
@@ -1222,12 +1241,13 @@ app.post("/api/warm", rateLimit(60 * 1000, 20), (req, res) => {
     const urgentUrls = valid.slice(0, 3).filter((u) => !streamResolving.has(u) && !warmQueue.includes(u));
     let urgent = urgentUrls.length;
     if (urgent > 0) {
-      // Urgent trio resolves IN PARALLEL (they're what the user is most likely
-      // to click in the next few seconds) — each via the tier-1 warmer slots.
+      // Urgent trio resolves IN PARALLEL at USER tier — they're what the user
+      // is most likely to click within seconds, so they must never queue behind
+      // background work.
       for (const u of urgentUrls) {
         const entry = { startedAt: Date.now(), promise: null };
         entry.promise = (async () => {
-          const m3u8Url = await fetchVideoPageForStream(u, 1);
+          const m3u8Url = await fetchVideoPageForStream(u, 0);
           if (m3u8Url) { cacheStream(u, m3u8Url); saveStreamCache(); warmPlaylists(m3u8Url).catch(() => {}); }
         })().finally(() => { if (streamResolving.get(u) === entry) streamResolving.delete(u); });
         streamResolving.set(u, entry);
@@ -1314,11 +1334,67 @@ function nextPoolCandidate() {
   return null; // everything warm (or resolving)
 }
 
+/* ---------- Category helpers ---------- */
+// Resolve the listing URL for any category key — known map URLs are used as-is,
+// unknown-but-plausible keys construct /categories/<key> (honest: no random-feed trap)
+function categoryUrl(catKey, page) {
+  const known = CATEGORIES[catKey];
+  const base = known || "https://xhamster.com/categories/" + encodeURIComponent(catKey);
+  if (page <= 1) return base;
+  const m = /xhamster\.com\/categories\/([^\/?]+)/.exec(base);
+  if (m) return "https://xhamster.com/categories/" + m[1] + "/" + page; // categories paginate as /<slug>/<n>
+  return base + "/" + page; // main feeds paginate as /<feed>/<n>
+}
+
+// Keep storage bounded: category pages evict oldest-first; main feeds are protected
+function enforceFeedCacheCap() {
+  const MAX_CAT_PAGES = 220;
+  const catEntries = Object.entries(feedCache.pages).filter(([k]) => !MAIN_FEED_KEYS.some((fk) => k.startsWith(fk + ":")));
+  if (catEntries.length <= MAX_CAT_PAGES) return;
+  catEntries.sort((a, b) => (a[1].ts || 0) - (b[1].ts || 0));
+  for (let i = 0; i < catEntries.length - MAX_CAT_PAGES; i++) delete feedCache.pages[catEntries[i][0]];
+}
+
+// ON-DEMAND category fetch at USER priority — the first visit to a category
+// waits (max ~7s) and returns THAT category's real videos instead of an empty page
+const categoryResolving = new Map(); // cacheKey -> { startedAt, promise }
+function fetchCategoryNow(cacheKey, catUrl) {
+  const existing = categoryResolving.get(cacheKey);
+  if (existing) return existing.promise;
+  const entry = { startedAt: Date.now(), promise: null };
+  entry.promise = (async () => {
+    if (backgroundFetches.has(cacheKey)) {
+      // a background job is already on it — wait for the cache to fill, then read it
+      for (let i = 0; i < 14; i++) {
+        await sleep(500);
+        const e = feedCache.pages[cacheKey];
+        if (e && e.cards && e.cards.length) return e.cards;
+        if (!backgroundFetches.has(cacheKey)) break;
+      }
+      const e = feedCache.pages[cacheKey];
+      return (e && e.cards) || [];
+    }
+    const html = await fetchPageHtml(catUrl, 0);
+    const cards = parseCards(html);
+    if (cards.length > 0) {
+      feedCache.pages[cacheKey] = { ts: Date.now(), cards };
+      enforceFeedCacheCap();
+      saveFeedCache();
+    }
+    return cards;
+  })().finally(() => { if (categoryResolving.get(cacheKey) === entry) categoryResolving.delete(cacheKey); });
+  categoryResolving.set(cacheKey, entry);
+  return entry.promise;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function warmPoolWorker() {
   console.log("[WarmPool] Worker started — target:", WARM_POOL_TARGET, "fresh streams");
   for (;;) {
     try {
+      // Active user browsing takes precedence — if a category page is being warmed,
+      // let it finish before pool churn adds relay load
+      if (warmQueue.length > 0 || categoryResolving.size > 0) { await sleep(4000); continue; }
       const fresh = countWarmStreams();
       if (fresh >= WARM_POOL_TARGET) {
         await sleep(10000); // pool is full — idle check

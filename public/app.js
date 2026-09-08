@@ -189,7 +189,15 @@
           countBadge.textContent = videos.length + " videos (page " + page + ")";
           showStatus("");
         } else {
-          showStatus("No videos yet — server is warming up, try again in a moment", true, 0, () => goToPage(page));
+          // Empty category page — server may still be fetching it; auto-retry once
+          showStatus("Loading " + (searchMode ? "results" : currentCategory) + " videos…", false);
+          setTimeout(() => {
+            if (gen !== loadGeneration) return;
+            if (!pageCache.get(page) || pageCache.get(page).length === 0) {
+              pageCache.delete(page);
+              goToPage(page);
+            }
+          }, 4500);
         }
       }
     } catch (e) {
