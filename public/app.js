@@ -768,7 +768,18 @@
         html += '</div></div>';
       }
       sidebarContent.innerHTML = html;
+      // HOVER-PREFETCH: 400ms hover par category background mein load —
+      // click karte hi instant dikheta hai (zero-wait categories)
       sidebarContent.querySelectorAll(".sidebar-item").forEach((btn) => {
+        let hoverTimer = null;
+        btn.addEventListener("mouseenter", () => {
+          hoverTimer = setTimeout(() => {
+            const cat = btn.dataset.cat;
+            if (!cat || cat === currentCategory) return;
+            fetch("/api/videos?page=1&category=" + encodeURIComponent(cat)).catch(() => {});
+          }, 400);
+        });
+        btn.addEventListener("mouseleave", () => { if (hoverTimer) clearTimeout(hoverTimer); });
         btn.addEventListener("click", () => {
           switchCategory(btn.dataset.cat);
           sidebarContent.querySelectorAll(".sidebar-item").forEach(b => b.classList.remove("active"));

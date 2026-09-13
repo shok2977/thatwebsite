@@ -18,6 +18,17 @@ try { chromium = require("playwright").chromium; console.log("[Playwright] Chrom
 const app = express();
 const PORT = Number(process.env.PORT) || 3080;
 
+// Keep-alive connection pooling for ALL upstream fetches (thumbs, playlists,
+// segments) — reusing TLS connections cuts per-request latency dramatically
+// versus a fresh handshake every time.
+const { Agent: UndiciAgent, setGlobalDispatcher } = require("undici");
+setGlobalDispatcher(new UndiciAgent({
+  connections: 64,
+  pipelining: 1,
+  keepAliveTimeout: 30 * 1000,
+  keepAliveMaxTimeout: 120 * 1000,
+}));
+
 /* ---------- Middleware ---------- */
 app.use(compression({ threshold: 512 }));
 app.use(express.json());
@@ -199,6 +210,15 @@ function loadCachesFromDisk() {
       }
       console.log("[StreamCache] Loaded", kept, "fresh of", Object.keys(loaded).length, "on disk");
     }
+  } catch (e) { /* ignore */ }
+  // SELF-HEALING purge: category entries saved before canonical-verification
+  // existed may contain wrong videos. Flush them all — correct ones re-fetch
+  // on first visit (hover-prefetch + prewarm rebuild the hot ones quickly).
+  try {
+    const PROTECTED = /^(all|newest|popular|top|hd|longest|hot):/;
+    const catKeys = Object.keys(feedCache.pages).filter((k) => !PROTECTED.test(k));
+    for (const k of catKeys) delete feedCache.pages[k];
+    if (catKeys.length) console.log("[Cache] Purged", catKeys.length, "category pages (pre-verification data)");
   } catch (e) { /* ignore */ }
 }
 loadCachesFromDisk();
@@ -704,7 +724,8 @@ async function backgroundFetchCategory(cacheKey, catUrl) {
   backgroundFetches.add(cacheKey);
   try {
     console.log("[Background] Fetching", cacheKey, "...");
-    const html = await fetchPageHtml(catUrl, 2);
+    const html = await fetchVerifiedPage(catUrl, 2);
+    if (!html) { console.warn("[Background] Wrong render for", cacheKey, "— skipped"); return; }
     const cards = parseCards(html);
     if (cards.length > 0) {
       feedCache.pages[cacheKey] = { ts: Date.now(), cards };
@@ -1235,10 +1256,10 @@ app.post("/api/warm", rateLimit(60 * 1000, 20), (req, res) => {
     const valid = urls.slice(0, 12).filter((u) =>
       typeof u === "string" && /^https:\/\/xhamster\.com\/videos\//.test(u) && !isStreamFresh(streamCache[u])
     );
-    // URGENT: first 3 cards resolve back-to-back (sequential, high priority) — users
+    // URGENT: first 6 cards resolve in parallel at USER tier — users
     // overwhelmingly click one of the first visible cards, so those must be warm
     // within a few seconds of page render even while the paced queue covers the rest.
-    const urgentUrls = valid.slice(0, 3).filter((u) => !streamResolving.has(u) && !warmQueue.includes(u));
+    const urgentUrls = valid.slice(0, 6).filter((u) => !streamResolving.has(u) && !warmQueue.includes(u));
     let urgent = urgentUrls.length;
     if (urgent > 0) {
       // Urgent trio resolves IN PARALLEL at USER tier — they're what the user
@@ -1355,7 +1376,36 @@ function enforceFeedCacheCap() {
   for (let i = 0; i < catEntries.length - MAX_CAT_PAGES; i++) delete feedCache.pages[catEntries[i][0]];
 }
 
-// ON-DEMAND category fetch at USER priority — the first visit to a category
+// Category page integrity: SSR initials carry the page's own route metadata
+// (activePage/category slug). If the render landed somewhere else (redirect,
+// consent wall), don't cache it as this category.
+/* ---------- Render verification via canonical tag ----------
+ * Every valid xhamster render carries <link rel="canonical"> pointing at the
+ * page ITSELF. A wrong render (geo-variant, redirect, feed page) has a
+ * different canonical — so this check is exact, unlike substring matching.
+ */
+function isCorrectRender(html, targetUrl) {
+  if (typeof html !== "string" || !html) return false;
+  const canon = /rel="canonical"\s+href="([^"]+)"/.exec(html) || /href="([^"]+)"\s+rel="canonical"/.exec(html);
+  if (!canon) return false;
+  const norm = (u) => {
+    try { return new URL(u).pathname.replace(/\/\d+\/?$/, "").replace(/\/$/, ""); }
+    catch (e) { return ""; }
+  };
+  return norm(canon[1]) === norm(targetUrl);
+}
+
+// Fetch + verify; on a wrong winner, force one uncached jina render.
+// Returns verified html, or null if we can't get the right page.
+async function fetchVerifiedPage(targetUrl, tier) {
+  let html = await fetchPageHtml(targetUrl, tier);
+  if (isCorrectRender(html, targetUrl)) return html;
+  console.warn("[Verify] Wrong render won for", targetUrl, "— forcing uncached retry");
+  const retry = await fetchJinaCurl(targetUrl, 10, true).catch(() => "");
+  if (isCorrectRender(retry, targetUrl)) return retry;
+  return null;
+}
+
 // waits (max ~7s) and returns THAT category's real videos instead of an empty page
 const categoryResolving = new Map(); // cacheKey -> { startedAt, promise }
 function fetchCategoryNow(cacheKey, catUrl) {
@@ -1374,7 +1424,8 @@ function fetchCategoryNow(cacheKey, catUrl) {
       const e = feedCache.pages[cacheKey];
       return (e && e.cards) || [];
     }
-    const html = await fetchPageHtml(catUrl, 0);
+    const html = await fetchVerifiedPage(catUrl, 0);
+    if (!html) return []; // honest empty — never cache wrong videos
     const cards = parseCards(html);
     if (cards.length > 0) {
       feedCache.pages[cacheKey] = { ts: Date.now(), cards };
@@ -1639,6 +1690,18 @@ async function startupSeed() {
 
   // Zero-wait engine: keep the homepage's visible videos stream-warm at all times
   warmPoolWorker().catch((e) => console.warn("[WarmPool] Worker crashed:", e.message));
+
+  // Startup category pre-warm: page-1 of the first 24 sidebar categories loads
+  // in the background (tier-2) so the FIRST click on a category is instant too.
+  // Bounded by the feedCache LRU cap — storage stays flat.
+  setTimeout(async () => {
+    const catKeys = Object.keys(CATEGORIES).filter((k) => !MAIN_FEED_KEYS.includes(k)).slice(0, 24);
+    console.log("[PreWarm] Pre-fetching", catKeys.length, "category pages...");
+    for (const ck of catKeys) {
+      ensurePageFresh(ck, 1, 2);
+      await sleep(250); // paced
+    }
+  }, 15000); // after main feeds are warm
 }
 
 /* ---------- Start server ---------- */
