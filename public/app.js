@@ -62,6 +62,8 @@
   let searchKeyword = "";
   let searchDebounceTimer = null;
   const SEARCH_HISTORY_KEY = "ts-search-history";
+  let suggestItems = [];   // live /api/suggest results (xhamster JSON API — report §6a)
+  let suggestSeq = 0;
   const SEARCH_HISTORY_MAX = 8;
 
   /* ========== HELPERS ========== */
@@ -396,6 +398,8 @@
   function enterSearchMode(keyword) {
     searchMode = true;
     searchKeyword = keyword;
+    suggestItems = [];
+    suggestSeq++;    // in-flight suggest responses are now stale
     loadGeneration++;
     allVideos = [];
     pageCache.clear();
@@ -408,6 +412,7 @@
     searchMode = false;
     searchKeyword = "";
     searchInput.value = "";
+    suggestItems = [];
     searchClear.classList.add("hidden");
     loadGeneration++;
     allVideos = [];
@@ -416,13 +421,25 @@
     goToPage(1);
   }
 
+  /* ========== LIVE SUGGEST (server /api/suggest → xhamster suggest API) ========== */
+  async function fetchSuggestions(q) {
+    const seq = ++suggestSeq;
+    try {
+      const r = await fetch("/api/suggest?q=" + encodeURIComponent(q));
+      const j = await r.json();
+      if (seq !== suggestSeq) return;             // a newer keystroke already answered
+      suggestItems = (j && j.suggestions) || [];
+      renderSearchDropdown();
+    } catch (e) { if (seq === suggestSeq) suggestItems = []; }
+  }
+
   searchInput.addEventListener("input", () => {
     const val = searchInput.value.trim();
     if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
-    if (!val) { searchClear.classList.add("hidden"); renderSearchDropdown(); return; }
+    if (!val) { suggestItems = []; suggestSeq++; searchClear.classList.add("hidden"); renderSearchDropdown(); return; }
     searchClear.classList.remove("hidden");
-    searchDropdown && searchDropdown.classList.add("hidden");
-    searchDebounceTimer = setTimeout(() => { enterSearchMode(val); }, 400);
+    if (val.length >= 2) fetchSuggestions(val); else suggestItems = [];
+    searchDebounceTimer = setTimeout(() => { searchDropdown && searchDropdown.classList.add("hidden"); enterSearchMode(val); }, 400);
   });
 
   searchInput.addEventListener("keydown", (e) => {
@@ -463,11 +480,24 @@
   function renderSearchDropdown() {
     if (!searchDropdown) return;
     const hist = getSearchHistory();
-    if (searchInput !== document.activeElement && hist.length === 0) {
+    if (suggestItems.length === 0 && hist.length === 0) {
+      searchDropdown.classList.add("hidden");
+      return;
+    }
+    if (searchInput !== document.activeElement && !searchDropdown.contains(document.activeElement)) {
       searchDropdown.classList.add("hidden");
       return;
     }
     let html = "";
+    if (suggestItems.length > 0) {
+      html += '<div class="search-dropdown-header">Suggestions</div>';
+      for (const s of suggestItems) {
+        const badge = s.kind === "channel" && s.count ? ' <span style="opacity:.55;font-size:11px">· ' + s.count + ' videos</span>' : "";
+        html += '<button class="search-dropdown-item" data-kw="' + escapeHtml(s.text) + '">';
+        html += '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
+        html += escapeHtml(s.text) + badge + '</button>';
+      }
+    }
     if (hist.length > 0) {
       html += '<div class="search-dropdown-header">Recent Searches</div>';
       for (const kw of hist) {
@@ -768,18 +798,7 @@
         html += '</div></div>';
       }
       sidebarContent.innerHTML = html;
-      // HOVER-PREFETCH: 400ms hover par category background mein load —
-      // click karte hi instant dikheta hai (zero-wait categories)
       sidebarContent.querySelectorAll(".sidebar-item").forEach((btn) => {
-        let hoverTimer = null;
-        btn.addEventListener("mouseenter", () => {
-          hoverTimer = setTimeout(() => {
-            const cat = btn.dataset.cat;
-            if (!cat || cat === currentCategory) return;
-            fetch("/api/videos?page=1&category=" + encodeURIComponent(cat)).catch(() => {});
-          }, 400);
-        });
-        btn.addEventListener("mouseleave", () => { if (hoverTimer) clearTimeout(hoverTimer); });
         btn.addEventListener("click", () => {
           switchCategory(btn.dataset.cat);
           sidebarContent.querySelectorAll(".sidebar-item").forEach(b => b.classList.remove("active"));

@@ -14,9 +14,8 @@
     "express": "^4.19.2",
     "hls.js": "^1.5.13",
     "mongoose": "^8.11.0",
-    "node-cron": "^3.0.3",
+    "node-cron": "^4.6.0",
     "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.1",
-    "undici": "^8.10.2"
+    "swagger-ui-express": "^5.0.1"
   }
 }
